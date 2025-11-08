@@ -9,7 +9,7 @@ CFG <- list(
   base_dir        = ".",            # project root (contains ./harsh_process and ./.data or ./data)
   participant     = "ParticipantX", # e.g., "Anuradha_Right"
   gesture         = "SwipeV",       # e.g., "SwipeV"
-  iou_threshold   = 0.30,           # IoU threshold for blob matching
+  iou_threshold   = 0.20,           # IoU threshold for blob matching
   edge_mode       = "complete",     # "complete" = all pairs in A×B; "intersection" = only intersecting cells
   out_dir         = "networks",     # where to save PNGs/CSVs; created if missing
   plot_png        = TRUE,           # save plots per-interval as PNG
@@ -226,6 +226,80 @@ plot_interval_graph <- function(g, title, save_png = FALSE, png_file = NULL,
   if (save_png && !is.null(png_file)) dev.off()
 }
 
+# ---------- Discovery helpers (participants & gestures) ----------
+list_participants <- function(base_dir) {
+  p1 <- file.path(base_dir, ".data")
+  p2 <- file.path(base_dir, "data")
+  d1 <- if (dir.exists(p1)) list.dirs(p1, full.names = FALSE, recursive = FALSE) else character()
+  d2 <- if (dir.exists(p2)) list.dirs(p2, full.names = FALSE, recursive = FALSE) else character()
+  sort(unique(c(d1, d2)))
+}
+
+list_gestures <- function(base_dir, participant) {
+  roots <- c(file.path(base_dir, ".data", participant),
+             file.path(base_dir, "data",  participant))
+  roots <- roots[dir.exists(roots)]
+  if (!length(roots)) return(character())
+  
+  files <- unlist(lapply(roots, function(r)
+    list.files(r, pattern = "_timestamp(_merge)?\\.txt$", full.names = FALSE)
+  ))
+  if (!length(files)) return(character())
+  
+  gestures <- unique(sub("_timestamp(_merge)?\\.txt$", "", files))
+  
+  # keep only gestures that have some frames under harsh_process/<participant>/<gesture>
+  keep <- vapply(gestures, function(g) {
+    hp <- file.path(base_dir, "harsh_process", participant, g)
+    if (!dir.exists(hp)) return(FALSE)
+    any(grepl("^f\\d{4,5}\\.csv$", list.files(hp)))
+  }, logical(1))
+  
+  sort(gestures[keep])
+}
+
+run_one_pair <- function(base_cfg, participant, gesture) {
+  cfg <- base_cfg
+  cfg$participant <- participant
+  cfg$gesture     <- gesture
+  msg("=== %s / %s ===", participant, gesture)
+  tryCatch({
+    build_networks_for_intervals(cfg)
+    TRUE
+  }, error = function(e) {
+    msg("!! Skipped %s / %s — %s", participant, gesture, conditionMessage(e))
+    FALSE
+  })
+}
+
+# Batch driver:
+# - If `participants` is NULL -> discover from .data/ and data/
+# - If `participants` is a single name and `gestures` is NULL -> discover all gestures for that participant
+# - If both provided -> iterate their cross product (only those with timestamp+frames will run)
+build_all_networks <- function(cfg = CFG, participants = NULL, gestures = NULL) {
+  if (is.null(participants)) {
+    participants <- list_participants(cfg$base_dir)
+  }
+  if (!length(participants)) {
+    stop("No participants found under .data/ or data/.", call. = FALSE)
+  }
+  
+  total <- 0L; ok <- 0L
+  for (p in participants) {
+    G <- if (is.null(gestures)) list_gestures(cfg$base_dir, p) else gestures
+    if (!length(G)) {
+      msg("[info] No gestures found for participant '%s' — skipping.", p)
+      next
+    }
+    for (g in G) {
+      total <- total + 1L
+      ok <- ok + as.integer(run_one_pair(cfg, p, g))
+    }
+  }
+  msg("=== Done: %d/%d successful pair(s). ===", ok, total)
+  invisible(ok == total)
+}
+
 # ---------------------- Main driver ----------------------
 build_networks_for_intervals <- function(cfg = CFG) {
   ts_path <- resolve_timestamp_file(cfg$base_dir, cfg$participant, cfg$gesture)
@@ -270,8 +344,8 @@ build_networks_for_intervals <- function(cfg = CFG) {
   }
   
   # Ensure output directories
-  out_png_dir <- file.path(cfg$out_dir, cfg$participant, cfg$gesture, "png")
-  out_csv_dir <- file.path(cfg$out_dir, cfg$participant, cfg$gesture, "csv")
+  out_png_dir <- file.path(cfg$out_dir, cfg$iou_threshold, cfg$participant, cfg$gesture, "png")
+  out_csv_dir <- file.path(cfg$out_dir, cfg$iou_threshold, cfg$participant, cfg$gesture, "csv")
   dir.create(out_png_dir, recursive = TRUE, showWarnings = FALSE)
   dir.create(out_csv_dir, recursive = TRUE, showWarnings = FALSE)
   
@@ -352,12 +426,6 @@ build_networks_for_intervals <- function(cfg = CFG) {
   invisible(TRUE)
 }
 
-# ---------------------- Execution ----------------------
-CFG$participant   <- "Mark_Right"
-CFG$gesture       <- "Press"
-CFG$iou_threshold <- 0.00
-CFG$base_dir      <- "."
-CFG$edge_mode     <- "complete"
 
-# Run
-build_networks_for_intervals(CFG)
+# ---------------------- RUN ----------------------
+build_all_networks(CFG)
