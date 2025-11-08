@@ -169,37 +169,43 @@ edges_between_components <- function(compA, compB, mode = "complete") {
 
 # Make graph from edge list (two-column integer matrix), attach grid layout coords
 graph_from_edges_with_grid_layout <- function(edges, nr, nc) {
-  if (is.null(edges) || nrow(edges) == 0) {
-    return(make_empty_graph(directed = TRUE))
-  }
-  # Vertex table with row/col derived from linear index in an nr x nc matrix (col-major)
-  verts_ids <- sort(unique(as.integer(c(edges[,1], edges[,2]))))
-  rc <- arrayInd(verts_ids, .dim = c(nr, nc))
+  # Ensure the graph always contains every vertex in the nr x nc grid
+  all_ids <- seq_len(nr * nc)
+  rc <- arrayInd(all_ids, .dim = c(nr, nc))
   Vtbl <- data.frame(
-    name = as.character(verts_ids),
+    name = as.character(all_ids),
     row  = rc[,1],
     col  = rc[,2],
     stringsAsFactors = FALSE
   )
-  Edf <- data.frame(
-    from = as.character(edges[,1]),
-    to   = as.character(edges[,2]),
-    stringsAsFactors = FALSE
-  )
+  
+  if (!is.null(edges) && nrow(edges) > 0) {
+    Edf <- data.frame(
+      from = as.character(edges[,1]),
+      to   = as.character(edges[,2]),
+      stringsAsFactors = FALSE
+    )
+  } else {
+    Edf <- data.frame(from = character(), to = character(), stringsAsFactors = FALSE)
+  }
+  
   g <- graph_from_data_frame(Edf, directed = TRUE, vertices = Vtbl)
   # store a default layout in vertex attributes (x: col, y: flipped row so origin at bottom-left)
   V(g)$x <- V(g)$col
-  V(g)$y <- max(V(g)$row) - V(g)$row + 1
+  V(g)$y <- nr - V(g)$row + 1
   g
 }
 
 plot_interval_graph <- function(g, title, save_png = FALSE, png_file = NULL,
                                 width = 1200, height = 900, pointsize = 14) {
-  if (vcount(g) == 0 || ecount(g) == 0) {
-    msg("[plot] %s — empty (no edges)", title)
+  if (vcount(g) == 0) {
+    msg("[plot] %s — empty graph (no vertices)", title)
     return(invisible())
   }
   coords <- cbind(V(g)$x, V(g)$y)
+  active_vertices <- degree(g, mode = "all") > 0
+  vertex_colors <- ifelse(active_vertices, "black", NA)
+  vertex_frames <- ifelse(active_vertices, "black", "gray70")
   if (save_png && !is.null(png_file)) {
     dir.create(dirname(png_file), recursive = TRUE, showWarnings = FALSE)
     png(filename = png_file, width = width, height = height, pointsize = pointsize)
@@ -210,7 +216,8 @@ plot_interval_graph <- function(g, title, save_png = FALSE, png_file = NULL,
     layout = coords,
     vertex.size = 4,
     vertex.label = NA,
-    vertex.color = "gray70",
+    vertex.color = vertex_colors,
+    vertex.frame.color = vertex_frames,
     edge.arrow.size = 0.25,
     edge.curved = 0,
     main = title
@@ -300,27 +307,32 @@ build_networks_for_intervals <- function(cfg = CFG) {
     
     if (length(all_edges) == 0) {
       msg("Interval %d produced 0 edges (empty network).", k)
-      next
+      edges_mat <- matrix(integer(0), ncol = 2)
+    } else {
+      edges_mat <- do.call(rbind, all_edges)
     }
     
-    edges_mat <- do.call(rbind, all_edges)
     g <- graph_from_edges_with_grid_layout(edges_mat, nr, nc)
     
-    # Keep only nodes with at least one edge
-    keep <- which(degree(g, mode = "all") > 0)
-    g <- induced_subgraph(g, vids = keep)
+    active_count <- sum(degree(g, mode = "all") > 0)
     
-    title <- sprintf("%s / %s — interval %d [%d → %d], |V|=%d, |E|=%d, IoU≥%.2f, mode=%s",
-                     cfg$participant, cfg$gesture, k, start_f, end_f, vcount(g), ecount(g),
-                     cfg$iou_threshold, cfg$edge_mode)
+    title <- sprintf("%s / %s — interval %d [%d → %d], |V|=%d (%d active), |E|=%d, IoU≥%.2f, mode=%s",
+                     cfg$participant, cfg$gesture, k, start_f, end_f, vcount(g), active_count,
+                     ecount(g), cfg$iou_threshold, cfg$edge_mode)
     
     # Save edge list for the interval (optional but handy for R analysis)
     csv_path <- file.path(out_csv_dir, sprintf("%s_%s_interval_%03d_edges.csv",
                                                cfg$participant, cfg$gesture, k))
-    utils::write.csv(
-      data.frame(from = ends(g, E(g))[,1], to = ends(g, E(g))[,2]),
-      file = csv_path, row.names = FALSE
-    )
+    if (ecount(g) > 0) {
+      edge_df <- data.frame(
+        from = ends(g, E(g))[,1],
+        to   = ends(g, E(g))[,2],
+        stringsAsFactors = FALSE
+      )
+    } else {
+      edge_df <- data.frame(from = character(), to = character(), stringsAsFactors = FALSE)
+    }
+    utils::write.csv(edge_df, file = csv_path, row.names = FALSE)
     
     # Plot
     png_path <- file.path(out_png_dir, sprintf("%s_%s_interval_%03d.png",
@@ -341,9 +353,9 @@ build_networks_for_intervals <- function(cfg = CFG) {
 }
 
 # ---------------------- Execution ----------------------
-CFG$participant   <- "Anuradha_Right"
-CFG$gesture       <- "SwipeV"
-CFG$iou_threshold <- 0.30
+CFG$participant   <- "Mark_Right"
+CFG$gesture       <- "Press"
+CFG$iou_threshold <- 0.00
 CFG$base_dir      <- "."
 CFG$edge_mode     <- "complete"
 
