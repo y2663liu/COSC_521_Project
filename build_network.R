@@ -9,7 +9,7 @@ CFG <- list(
   base_dir        = "./../PressureSensorPi/",            # project root (contains ./harsh_process and ./.data or ./data)
   participant     = "ParticipantX", # e.g., "Anuradha_Right"
   gesture         = "SwipeV",       # e.g., "SwipeV"
-  iou_threshold   = 0.0,           # IoU threshold for blob matching
+  iou_threshold   = 0.20,           # IoU threshold for blob matching
   edge_mode       = "complete",     # "complete" = all pairs in A×B; "intersection" = only intersecting cells
   out_dir         = "networks",     # where to save PNGs/CSVs; created if missing
   plot_png        = TRUE,           # save plots per-interval as PNG
@@ -70,7 +70,26 @@ read_frame_matrix <- function(base_dir, participant, gesture, frame_idx) {
   mat <- tryCatch({
     as.matrix(utils::read.csv(fn, header = FALSE, check.names = FALSE))
   }, error = function(e) NULL)
-  mat
+  pool_2x2(mat)
+}
+
+# Perform 2x2 max pooling. If dimensions are odd, the last row/column is dropped.
+pool_2x2 <- function(mat) {
+  nr <- nrow(mat); nc <- ncol(mat)
+  if (is.null(nr) || is.null(nc) || nr < 2 || nc < 2) return(mat)
+  
+  r1 <- seq(1, nr - 1, by = 2)
+  c1 <- seq(1, nc - 1, by = 2)
+  pooled <- matrix(0, nrow = length(r1), ncol = length(c1))
+  
+  for (i in seq_along(r1)) {
+    for (j in seq_along(c1)) {
+      block <- mat[r1[i]:(r1[i] + 1L), c1[j]:(c1[j] + 1L)]
+      pooled[i, j] <- max(block, na.rm = TRUE)
+    }
+  }
+  
+  pooled
 }
 
 # Label 4-neighbor connected components on a logical matrix; return list of integer-index vectors (linear indices)
@@ -344,8 +363,9 @@ build_networks_for_intervals <- function(cfg = CFG) {
   }
   
   # Ensure output directories
-  out_png_dir <- file.path(cfg$out_dir, cfg$iou_threshold, cfg$participant, cfg$gesture, "png")
-  out_csv_dir <- file.path(cfg$out_dir, cfg$iou_threshold, cfg$participant, cfg$gesture, "csv")
+  iou_dir <- sprintf("%s_pool", cfg$iou_threshold)
+  out_png_dir <- file.path(cfg$out_dir, iou_dir, cfg$participant, cfg$gesture, "png")
+  out_csv_dir <- file.path(cfg$out_dir, iou_dir, cfg$participant, cfg$gesture, "csv")
   dir.create(out_png_dir, recursive = TRUE, showWarnings = FALSE)
   dir.create(out_csv_dir, recursive = TRUE, showWarnings = FALSE)
   
