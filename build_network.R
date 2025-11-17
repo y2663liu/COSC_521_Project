@@ -6,10 +6,10 @@ library(igraph)
 
 # ---------------------- Configuration (can be overridden via CLI) ----------------------
 CFG <- list(
-  base_dir        = ".",            # project root (contains ./harsh_process and ./.data or ./data)
+  base_dir        = "./../PressureSensorPi/",            # project root (contains ./harsh_process and ./.data or ./data)
   participant     = "ParticipantX", # e.g., "Anuradha_Right"
   gesture         = "SwipeV",       # e.g., "SwipeV"
-  iou_threshold   = 0.20,           # IoU threshold for blob matching
+  iou_threshold   = 0.0,           # IoU threshold for blob matching
   edge_mode       = "complete",     # "complete" = all pairs in A×B; "intersection" = only intersecting cells
   out_dir         = "networks",     # where to save PNGs/CSVs; created if missing
   plot_png        = TRUE,           # save plots per-interval as PNG
