@@ -1,24 +1,85 @@
-# build_interval_networks_v2.R
 library(igraph)
 
 # ---------------------- Configuration ----------------------
 CFG <- list(
-  base_dir          = "./../PressureSensorPi/",
-  participant       = "Mark_Right", 
-  gesture           = "Press",       
-  iou_threshold     = 0.20,           # IoU to determine if two blobs are the "same object"
-  movement_threshold= 0.5,            # Minimum pixel shift required to draw edges (Filters stationary presses)
-  min_seq_len       = 10,             # Minimum frames required for a valid sequence
-  out_dir           = "networks_flow",
-  plot_png          = TRUE,
-  png_width         = 1200,
-  png_height        = 900
+  base_dir           = "./../PressureSensorPi/",
+  
+  # --- Pre-processing Params ---
+  use_pooling        = FALSE,          # TRUE = 2x2 Max Pool (32x32), FALSE = Raw (64x64)
+  min_pressure_sum   = 100,            # Filter: Frame valid only if sum of pixels > this
+  min_seq_len        = 10,             # Filter: Min frames for valid sequence
+  
+  # --- Network / Flow Params ---
+  iou_threshold      = 0.20,           # 1. Primary Match: Min Overlap to match blobs
+  max_match_dist     = 5.0,           # 2. Fallback Match: Max Distance (pixels) if IoU is 0
+  movement_threshold = 0.5,           # Min pixel shift to draw edge (Filters stationary)
+  edge_mode          = "flow",         # "flow" = centroid vector
+  
+  # --- Output Params ---
+  out_dir            = "networks_flow",
+  plot_png           = TRUE,
+  png_width          = 1200,
+  png_height         = 900,
+  png_pointsize      = 14
 )
 
-# ---------------------- Utilities ----------------------
+# ---------------------- 1. Discovery Utilities ----------------------
 msg <- function(...) cat(sprintf(...), "\n")
 
-# 2x2 Max Pooling (Preserved from your original code)
+list_participants <- function(base_dir) {
+  p1 <- file.path(base_dir, ".data")
+  p2 <- file.path(base_dir, "data")
+  d1 <- if (dir.exists(p1)) list.dirs(p1, full.names = FALSE, recursive = FALSE) else character()
+  d2 <- if (dir.exists(p2)) list.dirs(p2, full.names = FALSE, recursive = FALSE) else character()
+  sort(unique(c(d1, d2)))
+}
+
+list_gestures <- function(base_dir, participant) {
+  roots <- c(file.path(base_dir, ".data", participant),
+             file.path(base_dir, "data",  participant))
+  roots <- roots[dir.exists(roots)]
+  if (!length(roots)) return(character())
+  
+  files <- unlist(lapply(roots, function(r)
+    list.files(r, pattern = "_timestamp(_merge)?\\.txt$", full.names = FALSE)
+  ))
+  if (!length(files)) return(character())
+  
+  gestures <- unique(sub("_timestamp(_merge)?\\.txt$", "", files))
+  
+  keep <- vapply(gestures, function(g) {
+    hp <- file.path(base_dir, "harsh_process", participant, g)
+    if (!dir.exists(hp)) return(FALSE)
+    any(grepl("^f\\d{4,5}\\.csv$", list.files(hp)[1:10])) 
+  }, logical(1))
+  
+  sort(gestures[keep])
+}
+
+resolve_timestamp_file <- function(base_dir, participant, gesture) {
+  candidates <- c(
+    file.path(base_dir, ".data", participant, sprintf("%s_timestamp_merge.txt", gesture)),
+    file.path(base_dir, "data",  participant, sprintf("%s_timestamp_merge.txt", gesture)),
+    file.path(base_dir, ".data", participant, sprintf("%s_timestamp.txt",        gesture)),
+    file.path(base_dir, "data",  participant, sprintf("%s_timestamp.txt",        gesture))
+  )
+  existing <- candidates[file.exists(candidates)]
+  if (length(existing) == 0) stop("No timestamp file found")
+  existing[[1]]
+}
+
+parse_intervals <- function(ts_path) {
+  lines <- readLines(ts_path, warn = FALSE)
+  intervals <- list()
+  for (ln in lines) {
+    if (startsWith(trimws(ln), "#") || !nzchar(trimws(ln))) next
+    nums <- as.integer(regmatches(ln, gregexpr("\\d+", ln))[[1]])
+    if (length(nums) >= 2) intervals[[length(intervals)+1]] <- c(min(nums), max(nums))
+  }
+  intervals
+}
+
+# ---------------------- 2. Image Processing Utilities ----------------------
 pool_2x2 <- function(mat) {
   nr <- nrow(mat); nc <- ncol(mat)
   if (is.null(nr) || nr < 2 || nc < 2) return(mat)
@@ -32,67 +93,16 @@ pool_2x2 <- function(mat) {
   pooled
 }
 
-# Read single frame
-read_frame_matrix <- function(base_dir, participant, gesture, frame_idx) {
-  fn <- file.path(base_dir, "harsh_process", participant, gesture, sprintf("f%05d.csv", frame_idx))
+read_frame_matrix <- function(cfg, frame_idx) {
+  fn <- file.path(cfg$base_dir, "harsh_process", cfg$participant, cfg$gesture, sprintf("f%05d.csv", frame_idx))
   if (!file.exists(fn)) return(NULL)
+  
   tryCatch({
     mat <- as.matrix(utils::read.csv(fn, header = FALSE, check.names = FALSE))
-    pool_2x2(mat) 
+    if (cfg$use_pooling) return(pool_2x2(mat)) else return(mat)
   }, error = function(e) NULL)
 }
 
-# ---------------------- Advanced Processing Logic ----------------------
-
-# 1. Load, Filter, and Interpolate Sequence
-load_and_clean_sequence <- function(cfg, start_f, end_f) {
-  # Load all frames into a list
-  frames <- list()
-  indices <- start_f:end_f
-  
-  # Check Length (Requirement 2)
-  if (length(indices) < cfg$min_seq_len) {
-    return(list(valid = FALSE, reason = "Sequence too short"))
-  }
-  
-  raw_mats <- vector("list", length(indices))
-  has_data <- logical(length(indices))
-  
-  for (i in seq_along(indices)) {
-    m <- read_frame_matrix(cfg$base_dir, cfg$participant, cfg$gesture, indices[i])
-    if (!is.null(m)) {
-      raw_mats[[i]] <- m
-      if (sum(m, na.rm=TRUE) > 0) has_data[i] <- TRUE
-    }
-  }
-  
-  # Check for Empty Sequence (Requirement 2)
-  if (!any(has_data)) {
-    return(list(valid = FALSE, reason = "Sequence contains no pressure data"))
-  }
-  
-  # Interpolation (Requirement 3)
-  # We fill gaps: if t-1 and t+1 exist, but t is empty/null, average them.
-  for (i in 2:(length(raw_mats) - 1)) {
-    if (!has_data[i] && has_data[i-1] && has_data[i+1]) {
-      # Linear interpolation
-      raw_mats[[i]] <- (raw_mats[[i-1]] + raw_mats[[i+1]]) / 2
-      has_data[i] <- TRUE
-      # msg("    -> Interpolated missing frame at index %d", indices[i])
-    }
-  }
-  
-  # Final check: Ensure dimensions are consistent
-  valid_mats <- raw_mats[has_data]
-  if (length(valid_mats) == 0) return(list(valid=FALSE, reason="No valid data after cleanup"))
-  
-  nr <- nrow(valid_mats[[1]])
-  nc <- ncol(valid_mats[[1]])
-  
-  list(valid = TRUE, mats = raw_mats, indices = indices, nr = nr, nc = nc, has_data = has_data)
-}
-
-# Connected Components (Preserved)
 label_components_4n <- function(mask) {
   nr <- nrow(mask); nc <- ncol(mask)
   if (nr == 0 || nc == 0) return(list())
@@ -125,185 +135,248 @@ label_components_4n <- function(mask) {
   comps
 }
 
-# Helper: Get Weighted Centroid (Row, Col) of a component
-get_centroid <- function(comp_indices, mat, nr) {
-  if (length(comp_indices) == 0) return(c(NA, NA))
-  
-  rows <- ((comp_indices - 1L) %% nr) + 1L
-  cols <- ((comp_indices - 1L) %/% nr) + 1L
-  
-  vals <- mat[comp_indices]
-  total_mass <- sum(vals)
-  
-  if (total_mass == 0) return(c(mean(rows), mean(cols)))
-  
-  w_r <- sum(rows * vals) / total_mass
-  w_c <- sum(cols * vals) / total_mass
-  c(w_r, w_c)
-}
+# ---------------------- 3. Advanced Logic ----------------------
 
-# Helper: IoU
 iou_sets <- function(a, b) {
   if (length(a) == 0 || length(b) == 0) return(0)
   length(intersect(a, b)) / length(unique(c(a, b)))
 }
 
-# ---------------------- Graph Construction ----------------------
+get_centroid <- function(comp_indices, mat, nr) {
+  if (length(comp_indices) == 0) return(c(NA, NA))
+  rows <- ((comp_indices - 1L) %% nr) + 1L
+  cols <- ((comp_indices - 1L) %/% nr) + 1L
+  vals <- mat[comp_indices]
+  total_mass <- sum(vals)
+  if (total_mass == 0) return(c(mean(rows), mean(cols)))
+  c(sum(rows * vals) / total_mass, sum(cols * vals) / total_mass)
+}
 
-build_networks_for_intervals <- function(cfg = CFG) {
-  # Resolve Timestamp
-  ts_path <- tryCatch(
-    file.path(cfg$base_dir, ".data", cfg$participant, sprintf("%s_timestamp_merge.txt", cfg$gesture)),
-    error = function(e) stop("Path error")
-  )
-  if (!file.exists(ts_path)) {
-    # Try alternative path
-    ts_path <- file.path(cfg$base_dir, "data", cfg$participant, sprintf("%s_timestamp_merge.txt", cfg$gesture))
-    print(ts_path)
-    if(!file.exists(ts_path)) stop("Timestamp file not found.")
+load_and_clean_sequence <- function(cfg, start_f, end_f) {
+  indices <- start_f:end_f
+  if (length(indices) < cfg$min_seq_len) return(list(valid = FALSE, reason = "Sequence too short"))
+  
+  raw_mats <- vector("list", length(indices))
+  has_data <- logical(length(indices))
+  
+  # 1. Load Raw Data
+  for (i in seq_along(indices)) {
+    m <- read_frame_matrix(cfg, indices[i])
+    if (!is.null(m)) {
+      raw_mats[[i]] <- m
+      if (sum(m, na.rm=TRUE) > cfg$min_pressure_sum) has_data[i] <- TRUE
+    }
   }
   
-  # Parse Intervals
-  lines <- readLines(ts_path)
-  intervals <- list()
-  for (ln in lines) {
-    nums <- as.integer(regmatches(ln, gregexpr("\\d+", ln))[[1]])
-    if (length(nums) >= 2) intervals[[length(intervals)+1]] <- c(nums[1], nums[2])
+  # Check if empty before interpolation
+  if (!any(has_data)) return(list(valid = FALSE, reason = "No valid frames"))
+  
+  # 2. Multi-Frame Interpolation
+  valid_indices <- which(has_data)
+  
+  # We need at least two valid frames to interpolate between them
+  if (length(valid_indices) >= 2) {
+    for (k in 1:(length(valid_indices) - 1)) {
+      idx1 <- valid_indices[k]
+      idx2 <- valid_indices[k+1]
+      
+      # If there is a gap greater than 0 (indices are not adjacent)
+      if (idx2 > idx1 + 1) {
+        mat_start <- raw_mats[[idx1]]
+        mat_end   <- raw_mats[[idx2]]
+        gap_len   <- idx2 - idx1
+        
+        # Fill the gap
+        for (j in 1:(gap_len - 1)) {
+          target_idx <- idx1 + j
+          
+          # Linear Interpolation Formula:
+          # val = start * (1 - alpha) + end * alpha
+          alpha <- j / gap_len 
+          
+          raw_mats[[target_idx]] <- (1 - alpha) * mat_start + alpha * mat_end
+          has_data[target_idx]   <- TRUE
+        }
+      }
+    }
   }
   
-  # Output Setup
-  dir.create(file.path(cfg$out_dir, "png"), recursive = TRUE, showWarnings = FALSE)
-  dir.create(file.path(cfg$out_dir, "csv"), recursive = TRUE, showWarnings = FALSE)
+  # 3. Final Output Selection
+  valid_mats <- raw_mats[has_data]
   
-  # --- Process Each Interval ---
+  if (length(valid_mats) == 0) return(list(valid=FALSE, reason="No valid data"))
+  
+  list(valid = TRUE, mats = raw_mats, indices = indices, 
+       nr = nrow(valid_mats[[1]]), nc = ncol(valid_mats[[1]]), has_data = has_data)
+}
+
+# ---------------------- 4. Core Network Builder ----------------------
+build_networks_for_intervals <- function(cfg) {
+  ts_path <- resolve_timestamp_file(cfg$base_dir, cfg$participant, cfg$gesture)
+  intervals <- parse_intervals(ts_path)
+  if (length(intervals) == 0) stop("No intervals found")
+  
+  pool_lbl <- if(cfg$use_pooling) "pool" else "raw"
+  subdir_name <- sprintf("%s_iou%.2f_move%.2f_dist%.0f", pool_lbl, cfg$iou_threshold, cfg$movement_threshold, cfg$max_match_dist)
+  
+  out_png_dir <- file.path(cfg$out_dir, subdir_name, cfg$participant, cfg$gesture, "png")
+  out_csv_dir <- file.path(cfg$out_dir, subdir_name, cfg$participant, cfg$gesture, "csv")
+  dir.create(out_png_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(out_csv_dir, recursive = TRUE, showWarnings = FALSE)
+  
   for (k in seq_along(intervals)) {
     iv <- intervals[[k]]
-    
-    # 1. Load & Clean Data (Filtering & Interpolation)
     seq_data <- load_and_clean_sequence(cfg, iv[1], iv[2])
-    
-    if (!seq_data$valid) {
-      msg("Skipping Interval %d (%d-%d): %s", k, iv[1], iv[2], seq_data$reason)
-      next
-    }
-    
-    msg("Processing Interval %d (%d-%d) | Frames: %d", k, iv[1], iv[2], length(seq_data$indices))
+    if (!seq_data$valid) next
     
     mats <- seq_data$mats
     nr <- seq_data$nr
     nc <- seq_data$nc
     all_edges <- list()
+    all_active_indices <- integer(0)
     
-    # 2. Traverse Frames
     for (i in 1:(length(mats) - 1)) {
       if (!seq_data$has_data[i] || !seq_data$has_data[i+1]) next
       
       mat_t  <- mats[[i]]
       mat_t1 <- mats[[i+1]]
-      
       comps_t  <- label_components_4n(mat_t > 0)
       comps_t1 <- label_components_4n(mat_t1 > 0)
       
-      # Match Blobs via IoU
-      # Simple greedy match
+      if(length(comps_t) > 0) all_active_indices <- c(all_active_indices, unlist(comps_t))
+      
+      # Pre-calculate Centroids for all blobs in both frames
+      cents_t  <- lapply(comps_t,  function(c) get_centroid(c, mat_t, nr))
+      cents_t1 <- lapply(comps_t1, function(c) get_centroid(c, mat_t1, nr))
+      
+      # MATCHING LOGIC
       used_j <- rep(FALSE, length(comps_t1))
       
       for (idx_a in seq_along(comps_t)) {
-        best_iou <- -1
-        best_idx_b <- NA
+        matched_idx_b <- NA
         
+        # 1. Primary Match: IoU
+        best_iou <- -1
+        cand_iou <- NA
         for (idx_b in seq_along(comps_t1)) {
           if (used_j[idx_b]) next
           val <- iou_sets(comps_t[[idx_a]], comps_t1[[idx_b]])
-          if (val > best_iou) { best_iou <- val; best_idx_b <- idx_b }
+          if (val > best_iou) { best_iou <- val; cand_iou <- idx_b }
         }
         
-        if (!is.na(best_idx_b) && best_iou > cfg$iou_threshold) {
-          used_j[best_idx_b] <- TRUE
+        if (!is.na(cand_iou) && best_iou > cfg$iou_threshold) {
+          matched_idx_b <- cand_iou
+        } else {
+          # 2. Fallback Match: Nearest Distance (if IoU failed)
+          best_dist <- Inf
+          cand_dist <- NA
+          c_a <- cents_t[[idx_a]]
           
-          # --- NEW LOGIC: Displacement Vector (Point 4 & 1) ---
+          for (idx_b in seq_along(comps_t1)) {
+            if (used_j[idx_b]) next # Don't steal already matched blobs
+            
+            c_b <- cents_t1[[idx_b]]
+            dist <- sqrt(sum((c_b - c_a)^2))
+            if (dist < best_dist) { best_dist <- dist; cand_dist <- idx_b }
+          }
           
-          # Calculate Centroids
-          cent_t  <- get_centroid(comps_t[[idx_a]], mat_t, nr)
-          cent_t1 <- get_centroid(comps_t1[[best_idx_b]], mat_t1, nr)
+          if (!is.na(cand_dist) && best_dist < cfg$max_match_dist) {
+            matched_idx_b <- cand_dist
+          }
+        }
+        
+        # PROCEED IF MATCH FOUND
+        if (!is.na(matched_idx_b)) {
+          used_j[matched_idx_b] <- TRUE
           
-          # Vector (dy, dx)
-          vec <- cent_t1 - cent_t
+          c_a <- cents_t[[idx_a]]
+          c_b <- cents_t1[[matched_idx_b]]
+          vec <- c_b - c_a
           magnitude <- sqrt(sum(vec^2))
           
-          # Only draw edges if movement is significant (Point 1)
           if (magnitude > cfg$movement_threshold) {
-            
-            comp_indices_t <- comps_t[[idx_a]]
-            
-            # Round vector to nearest integer for grid mapping
             shift_r <- round(vec[1])
             shift_c <- round(vec[2])
             
-            # Map every active cell in T to its projected position in T+1
-            for (lin_idx in comp_indices_t) {
+            for (lin_idx in comps_t[[idx_a]]) {
               r <- ((lin_idx - 1L) %% nr) + 1L
               c <- ((lin_idx - 1L) %/% nr) + 1L
+              tr <- r + shift_r; tc <- c + shift_c
               
-              target_r <- r + shift_r
-              target_c <- c + shift_c
-              
-              # Check bounds
-              if (target_r >= 1 && target_r <= nr && target_c >= 1 && target_c <= nc) {
-                target_lin <- (target_c - 1L) * nr + target_r
-                
-                # Optional: Strictly require target to be active in T+1?
-                # Let's require target to be non-zero to keep graph clean
-                if (mat_t1[target_r, target_c] > 0) {
-                  all_edges[[length(all_edges)+1]] <- c(lin_idx, target_lin)
+              if (tr >= 1 && tr <= nr && tc >= 1 && tc <= nc) {
+                if (mat_t1[tr, tc] > 0) {
+                  t_lin <- (tc - 1L) * nr + tr
+                  all_edges[[length(all_edges)+1]] <- c(lin_idx, t_lin)
                 }
               }
             }
-          } # end if moving
+          }
         }
       }
     }
     
-    # 3. Build Graph
-    if (length(all_edges) > 0) {
-      edges_mat <- do.call(rbind, all_edges)
-    } else {
-      edges_mat <- matrix(character(0), ncol=2)
-    }
+    last_mat <- mats[[length(mats)]]
+    last_comps <- label_components_4n(last_mat > 0)
+    if(length(last_comps) > 0) all_active_indices <- c(all_active_indices, unlist(last_comps))
+    all_active_indices <- unique(all_active_indices)
     
-    # Grid Layout Nodes
+    if (length(all_edges) > 0) edges_mat <- do.call(rbind, all_edges) else edges_mat <- matrix(character(0), ncol=2)
+    
     all_ids <- 1:(nr*nc)
     rc <- arrayInd(all_ids, .dim = c(nr, nc))
-    V_df <- data.frame(name=as.character(all_ids), x=rc[,2], y=nr-rc[,1]+1) # y flipped
+    V_df <- data.frame(name=as.character(all_ids), x=rc[,2], y=nr-rc[,1]+1)
     
-    # Create Graph
     g <- graph_from_data_frame(as.data.frame(edges_mat, stringsAsFactors=FALSE), vertices=V_df, directed=TRUE)
     
-    # Save CSV
-    csv_name <- file.path(cfg$out_dir, "csv", sprintf("%s_%s_int%d.csv", cfg$participant, cfg$gesture, k))
+    csv_name <- file.path(out_csv_dir, sprintf("int_%03d.csv", k))
     if(nrow(edges_mat) > 0) utils::write.csv(edges_mat, csv_name, row.names=FALSE)
     
-    # Plot
     if (cfg$plot_png) {
-      png_name <- file.path(cfg$out_dir, "png", sprintf("%s_%s_int%d.png", cfg$participant, cfg$gesture, k))
-      png(png_name, width=cfg$png_width, height=cfg$png_height)
+      png_name <- file.path(out_png_dir, sprintf("int_%03d.png", k))
+      png(png_name, width=cfg$png_width, height=cfg$png_height, pointsize=cfg$png_pointsize)
       
-      # Only plot active nodes/edges to keep it clean
-      deg <- degree(g, mode="all")
-      keep_v <- V(g)[deg > 0]
+      is_active <- V(g)$name %in% as.character(all_active_indices)
+      v_cols <- ifelse(is_active, "black", NA)
       
-      plot(g, 
-           vertex.size=3, 
-           vertex.label=NA, 
-           vertex.color=ifelse(deg>0, "black", NA), 
-           vertex.frame.color=NA,
-           edge.arrow.size=0.4,
-           edge.color="red",
-           main=sprintf("Flow Graph: Interval %d (Shift > %.1f)", k, cfg$movement_threshold))
+      plot(g, layout=cbind(V(g)$x, V(g)$y),
+           vertex.size=3, vertex.label=NA, vertex.color=v_cols, vertex.frame.color=NA,
+           edge.arrow.size=0.4, edge.color="red",
+           main=sprintf("%s/%s Int %d (Active:%d)", cfg$participant, cfg$gesture, k, length(all_active_indices)))
       dev.off()
     }
   }
 }
 
-# Run
-build_networks_for_intervals(CFG)
+# ---------------------- 5. Batch Drivers ----------------------
+
+run_one_pair <- function(base_cfg, participant, gesture) {
+  run_cfg <- base_cfg
+  run_cfg$participant <- participant
+  run_cfg$gesture     <- gesture
+  msg("=== Processing: %s / %s ===", participant, gesture)
+  tryCatch({
+    build_networks_for_intervals(run_cfg)
+    TRUE
+  }, error = function(e) {
+    msg("!! Error %s / %s: %s", participant, gesture, conditionMessage(e))
+    FALSE
+  })
+}
+
+build_all_networks <- function(cfg = CFG) {
+  participants <- list_participants(cfg$base_dir)
+  if (!length(participants)) stop("No participants found.")
+  
+  total <- 0L; ok <- 0L
+  for (p in participants) {
+    gestures <- list_gestures(cfg$base_dir, p)
+    if (!length(gestures)) next
+    for (g in gestures) {
+      total <- total + 1L
+      ok <- ok + as.integer(run_one_pair(cfg, p, g))
+    }
+  }
+  msg("=== Batch Complete: %d/%d successful. ===", ok, total)
+}
+
+build_all_networks(CFG)
