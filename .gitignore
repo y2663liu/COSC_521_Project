@@ -1,5 +1,7 @@
 # R
 .Rhistory
+.RData
 
 # results
 **/networks
+**/networks_flow
