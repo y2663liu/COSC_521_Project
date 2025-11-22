@@ -5,130 +5,108 @@ library(randomForest)
 library(nnet)
 
 # ---------------------- Config ----------------------
-DATA_FILE <- "gesture_features.csv"
+DATA_FILE <- "gesture_features_rewritten.csv"
 SEED <- 123
+DO_FEATURE_SELECTION <- TRUE 
 
 # ---------------------- Load & Prep ----------------------
 if (!file.exists(DATA_FILE)) stop("Run extract_features.R first!")
 
 df <- read.csv(DATA_FILE)
-
-# 1. Filter out bad rows (e.g. empty graphs with 0 nodes/edges if any)
-# Keep only rows where duration > 0
 df <- df %>% filter(duration > 0)
-
-# 2. Encode Target
 df$gesture <- as.factor(df$gesture)
 
-# 3. Select Feature Columns (Drop metadata)
-# We exclude 'participant' and 'interval' to prevent overfitting to specific users
-features <- df %>% select(-participant, -interval, -gesture)
+# --- Normalization & NZV Fix ---
+feature_cols <- setdiff(names(df), c("participant", "interval", "gesture"))
+preproc <- preProcess(df[, feature_cols], method = c("center", "scale", "nzv")) 
+df_norm <- predict(preproc, df)
+feature_cols <- setdiff(names(df_norm), c("participant", "interval", "gesture"))
 
-# 4. Normalize Features (Center & Scale)
-# Important for SVM and MLP
-preproc <- preProcess(features, method = c("center", "scale"))
-features_norm <- predict(preproc, features)
+# ---------------------- Feature Selection (RFE) ----------------------
+final_features <- feature_cols 
 
-# Combine back
-data_model <- cbind(gesture = df$gesture, features_norm)
+if (DO_FEATURE_SELECTION) {
+  cat("\n=== Running Recursive Feature Elimination (RFE) ===\n")
+  set.seed(SEED)
+  
+  # Using 5-fold CV for selection to save time/data
+  rfe_ctrl <- rfeControl(functions = rfFuncs, method = "cv", number = 5)
+  
+  # Test smaller subsets suitable for 1000 samples
+  subsets <- c(5, 8, 12, length(feature_cols))
+  subsets <- subsets[subsets <= length(feature_cols)]
+  
+  rfe_results <- rfe(
+    x = df_norm[, feature_cols], 
+    y = df_norm$gesture,
+    sizes = subsets,
+    rfeControl = rfe_ctrl
+  )
+  
+  print(rfe_results)
+  final_features <- predictors(rfe_results)
+  cat(sprintf("\nSelected %d features: %s\n", length(final_features), paste(final_features, collapse=", ")))
+}
+
+# ---------------------- Final Training Data ----------------------
+data_model <- df_norm[, c("gesture", final_features)]
 
 # ---------------------- Training Setup ----------------------
 set.seed(SEED)
-
-# 10-Fold Cross Validation
-ctrl <- trainControl(
-  method = "cv", 
-  number = 10, 
-  savePredictions = "final",
-  classProbs = TRUE  # Required for some metrics
-)
-
-msg <- function(...) cat(sprintf(...), "\n")
+# 10-Fold CV is standard and safe for N=1000
+ctrl <- trainControl(method = "cv", number = 10, savePredictions = "final", classProbs = TRUE)
 
 results <- list()
+msg <- function(...) cat(sprintf(...), "\n")
 
-# ---------------------- 1. Logistic Regression ----------------------
-msg("Training Multinomial Logistic Regression...")
-# 'multinom' from nnet package handles multi-class logistic regression
-fit_log <- train(
-  gesture ~ ., data = data_model,
-  method = "multinom",
-  trControl = ctrl,
-  trace = FALSE
-)
-results$Logistic <- fit_log
+msg("\n=== Training Models on Selected Features ===")
 
-# ---------------------- 2. SVM (Radial Basis) ----------------------
+# 1. Logistic Regression (Safe for small data)
+msg("Training Logistic Regression...")
+results$Logistic <- train(gesture ~ ., data = data_model, method = "multinom", trControl = ctrl, trace = FALSE)
+
+# 2. SVM Radial (Safe for small data)
 msg("Training SVM (Radial)...")
-fit_svm <- train(
-  gesture ~ ., data = data_model,
-  method = "svmRadial",
-  trControl = ctrl,
-  tuneLength = 5
-)
-results$SVM <- fit_svm
+results$SVM <- train(gesture ~ ., data = data_model, method = "svmRadial", trControl = ctrl, tuneLength = 5)
 
-# ---------------------- 3. Random Forest ----------------------
+# 3. Random Forest (Robust against overfitting)
 msg("Training Random Forest...")
-fit_rf <- train(
-  gesture ~ ., data = data_model,
-  method = "rf",
-  trControl = ctrl,
-  tuneLength = 3,
-  ntree = 100
-)
-results$RF <- fit_rf
+results$RF <- train(gesture ~ ., data = data_model, method = "rf", trControl = ctrl, tuneLength = 3, ntree = 100)
 
-# ---------------------- 4. MLP (Neural Net) ----------------------
+# 4. MLP (Adjusted for N=1051)
 msg("Training MLP...")
-# simple single-hidden-layer MLP from nnet
-# size = number of hidden units, decay = regularization
-grid_mlp <- expand.grid(size = c(5, 10, 20), decay = c(0.1, 0.01))
+# ADJUSTMENT: Smaller sizes (3, 5, 8) and higher decay (0.1, 0.5)
+# This forces the model to be simpler.
+grid_mlp <- expand.grid(size = c(3, 5, 8), decay = c(0.1, 0.5))
 
-fit_mlp <- train(
+results$MLP <- train(
   gesture ~ ., data = data_model,
   method = "nnet",
   trControl = ctrl,
   tuneGrid = grid_mlp,
   trace = FALSE,
-  linout = FALSE # FALSE for classification
+  linout = FALSE,
+  maxit = 200 # Limit iterations to prevent memorization
 )
-results$MLP <- fit_mlp
 
 # ---------------------- Evaluation ----------------------
-msg("\n=== Model Comparison ===")
-
-# Compare Accuracy and Kappa
+msg("\n=== Final Model Comparison ===")
 resamps <- resamples(results)
 print(summary(resamps))
 
-# Detailed per-model report
 for (name in names(results)) {
   model <- results[[name]]
-  
   msg("\n--- %s ---", name)
   
   # Best Tune Accuracy
   best_acc <- max(model$results$Accuracy)
   msg("Best CV Accuracy: %.2f%%", best_acc * 100)
   
-  # Confusion Matrix (on the CV predictions)
-  preds <- model$pred
-  # Filter for the best tuning parameter
-  # (caret stores all predictions during tuning, we only want the best ones)
-  if (!is.null(model$bestTune)) {
-    # merging logic to find rows matching best params
-    # simplified: just use predict on training set for a quick matrix 
-    # (or extract properly from 'preds' - let's use predict() for clarity on full set)
-    final_preds <- predict(model, data_model)
-    cm <- confusionMatrix(final_preds, data_model$gesture)
-    
-    print(cm$table)
-    msg("Macro F1: %.4f", mean(cm$byClass[, "F1"], na.rm=TRUE))
-  }
+  final_preds <- predict(model, data_model)
+  cm <- confusionMatrix(final_preds, data_model$gesture)
+  print(cm$table)
+  
+  f1 <- cm$byClass[, "F1"]
+  f1[is.na(f1)] <- 0 
+  msg("Macro F1: %.4f", mean(f1))
 }
-
-# Feature Importance (Random Forest)
-msg("\n--- Random Forest Feature Importance ---")
-varImp_rf <- varImp(fit_rf)
-print(varImp_rf)
