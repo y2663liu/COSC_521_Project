@@ -1,3 +1,5 @@
+# build_full_dataset_networks_v6.R
+
 library(igraph)
 
 # ---------------------- Configuration ----------------------
@@ -5,15 +7,16 @@ CFG <- list(
   base_dir           = "./../PressureSensorPi/",
   
   # --- Pre-processing Params ---
-  use_pooling        = FALSE,          # TRUE = 2x2 Max Pool (32x32), FALSE = Raw (64x64)
+  use_pooling        = FALSE,          # TRUE = 2x2 Max Pool (20x20), FALSE = Raw (40x40)
   min_pressure_sum   = 100,            # Filter: Frame valid only if sum of pixels > this
   min_seq_len        = 10,             # Filter: Min frames for valid sequence
   
   # --- Network / Flow Params ---
   iou_threshold      = 0.20,           # 1. Primary Match: Min Overlap to match blobs
-  max_match_dist     = 5.0,           # 2. Fallback Match: Max Distance (pixels) if IoU is 0
-  movement_threshold = 0.5,           # Min pixel shift to draw edge (Filters stationary)
+  max_match_dist     = 5.0,            # 2. Fallback Match: Max Distance (pixels) if IoU is 0
+  movement_threshold = 0.5,            # Min pixel shift to draw edge (Filters stationary)
   edge_mode          = "flow",         # "flow" = centroid vector
+  remove_duplicates  = TRUE,           # If TRUE, identical edges (A->B) occurring at different times are merged
   
   # --- Output Params ---
   out_dir            = "networks_flow",
@@ -217,7 +220,8 @@ build_networks_for_intervals <- function(cfg) {
   if (length(intervals) == 0) stop("No intervals found")
   
   pool_lbl <- if(cfg$use_pooling) "pool" else "raw"
-  subdir_name <- sprintf("%s_iou%.2f_move%.2f_dist%.0f", pool_lbl, cfg$iou_threshold, cfg$movement_threshold, cfg$max_match_dist)
+  rm_dup_lbl <- if(cfg$remove_duplicates) "sim" else "dup"
+  subdir_name <- sprintf("%s_iou%.2f_move%.2f_dist%.0f_%s", pool_lbl, cfg$iou_threshold, cfg$movement_threshold, cfg$max_match_dist, rm_dup_lbl)
   
   out_png_dir <- file.path(cfg$out_dir, subdir_name, cfg$participant, cfg$gesture, "png")
   out_csv_dir <- file.path(cfg$out_dir, subdir_name, cfg$participant, cfg$gesture, "csv")
@@ -320,7 +324,17 @@ build_networks_for_intervals <- function(cfg) {
     if(length(last_comps) > 0) all_active_indices <- c(all_active_indices, unlist(last_comps))
     all_active_indices <- unique(all_active_indices)
     
-    if (length(all_edges) > 0) edges_mat <- do.call(rbind, all_edges) else edges_mat <- matrix(character(0), ncol=2)
+    # --- GRAPH CONSTRUCTION with Duplicate Removal ---
+    if (length(all_edges) > 0) {
+      edges_mat <- do.call(rbind, all_edges)
+      
+      # NEW LOGIC: Remove Duplicate Edges
+      if (cfg$remove_duplicates) {
+        edges_mat <- unique(edges_mat)
+      }
+    } else {
+      edges_mat <- matrix(character(0), ncol=2)
+    }
     
     all_ids <- 1:(nr*nc)
     rc <- arrayInd(all_ids, .dim = c(nr, nc))
