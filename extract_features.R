@@ -5,11 +5,9 @@ library(dplyr)
 # ---------------------- Configuration ----------------------
 CFG <- list(
   base_dir        = "./../PressureSensorPi/",
-  network_dir     = "networks_flow",
-  # Point this to the specific subfolder you generated, e.g.:
-  # "networks_flow/pool_iou0.20_move0.50_dist5"
-  input_subdir    = "networks_flow/raw_iou0.20_move0.50_dist3_sim", 
-  out_file        = "gesture_features.csv"
+  network_dir     = "networks",
+  input_subdir    = "raw_iou0.20_move0.50_dist5_simple",
+  output_dir      = "train_data"
 )
 
 # ---------------------- Helpers ----------------------
@@ -146,7 +144,8 @@ compute_graph_metrics <- function(csv_path) {
 process_all <- function() {
   # Find all CSVs
   # Pattern: .../participant/gesture/csv/int_XXX.csv
-  csv_files <- list.files(CFG$input_subdir, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
+  input_dir <- file.path(CFG$network_dir, CFG$input_subdir)
+  csv_files <- list.files(input_dir, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
   
   if (length(csv_files) == 0) stop("No CSV files found in ", CFG$input_subdir)
   
@@ -179,7 +178,7 @@ process_all <- function() {
     
     # Combine
     row_data <- c(
-      list(participant = participant, gesture = gesture, interval = interval_idx),
+      list(participant = participant, gesture = gesture),
       as.list(raw_feats),
       g_feats
     )
@@ -192,8 +191,10 @@ process_all <- function() {
   # Clean NAs
   final_df[is.na(final_df)] <- 0
   
-  write.csv(final_df, CFG$out_file, row.names = FALSE)
-  msg("Done! Features saved to %s", CFG$out_file)
+  dir.create(CFG$output_dir, recursive = TRUE, showWarnings = FALSE)
+  out_file <- sprintf("%s/%s.csv", CFG$output_dir, CFG$input_subdir)
+  write.csv(final_df, out_file, row.names = FALSE)
+  msg("Done! Features saved to %s", out_file)
 }
 
 process_all()

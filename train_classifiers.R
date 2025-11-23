@@ -5,7 +5,7 @@ library(randomForest)
 library(nnet)
 
 # ---------------------- Config ----------------------
-DATA_FILE <- "gesture_features_rewritten.csv"
+DATA_FILE <- "train_data/raw_iou0.20_move0.50_dist5_simple_rewritten.csv"
 SEED <- 123
 DO_FEATURE_SELECTION <- TRUE 
 

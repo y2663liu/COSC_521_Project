@@ -1,5 +1,3 @@
-# build_full_dataset_networks_v6.R
-
 library(igraph)
 
 # ---------------------- Configuration ----------------------
@@ -8,18 +6,16 @@ CFG <- list(
   
   # --- Pre-processing Params ---
   use_pooling        = FALSE,          # TRUE = 2x2 Max Pool (20x20), FALSE = Raw (40x40)
-  min_pressure_sum   = 100,            # Filter: Frame valid only if sum of pixels > this
   min_seq_len        = 10,             # Filter: Min frames for valid sequence
   
   # --- Network / Flow Params ---
   iou_threshold      = 0.20,           # 1. Primary Match: Min Overlap to match blobs
-  max_match_dist     = 5.0,            # 2. Fallback Match: Max Distance (pixels) if IoU is 0
+  max_match_dist     = 5.0,           # 2. Fallback Match: Max Distance (pixels) if IoU is 0
   movement_threshold = 0.5,            # Min pixel shift to draw edge (Filters stationary)
-  edge_mode          = "flow",         # "flow" = centroid vector
   remove_duplicates  = TRUE,           # If TRUE, identical edges (A->B) occurring at different times are merged
   
   # --- Output Params ---
-  out_dir            = "networks_flow",
+  out_dir            = "networks",
   plot_png           = TRUE,
   png_width          = 1200,
   png_height         = 900,
@@ -160,57 +156,47 @@ load_and_clean_sequence <- function(cfg, start_f, end_f) {
   if (length(indices) < cfg$min_seq_len) return(list(valid = FALSE, reason = "Sequence too short"))
   
   raw_mats <- vector("list", length(indices))
-  has_data <- logical(length(indices))
   
-  # 1. Load Raw Data
+  # 1. Load Data
   for (i in seq_along(indices)) {
-    m <- read_frame_matrix(cfg, indices[i])
-    if (!is.null(m)) {
-      raw_mats[[i]] <- m
-      if (sum(m, na.rm=TRUE) > cfg$min_pressure_sum) has_data[i] <- TRUE
-    }
+    # If file exists, it is loaded. No pressure checks.
+    raw_mats[[i]] <- read_frame_matrix(cfg, indices[i]) 
   }
   
-  # Check if empty before interpolation
-  if (!any(has_data)) return(list(valid = FALSE, reason = "No valid frames"))
-  
   # 2. Multi-Frame Interpolation
-  valid_indices <- which(has_data)
+  # Identify valid indices dynamically by checking for NULL
+  valid_indices <- which(!vapply(raw_mats, is.null, logical(1)))
   
-  # We need at least two valid frames to interpolate between them
+  if (length(valid_indices) == 0) return(list(valid = FALSE, reason = "No valid frames"))
+  
   if (length(valid_indices) >= 2) {
     for (k in 1:(length(valid_indices) - 1)) {
       idx1 <- valid_indices[k]
       idx2 <- valid_indices[k+1]
       
-      # If there is a gap greater than 0 (indices are not adjacent)
+      # If gap > 0 (indices are not adjacent)
       if (idx2 > idx1 + 1) {
         mat_start <- raw_mats[[idx1]]
         mat_end   <- raw_mats[[idx2]]
         gap_len   <- idx2 - idx1
         
-        # Fill the gap
         for (j in 1:(gap_len - 1)) {
           target_idx <- idx1 + j
-          
-          # Linear Interpolation Formula:
-          # val = start * (1 - alpha) + end * alpha
           alpha <- j / gap_len 
-          
+          # Fill the NULL slot with interpolated matrix
           raw_mats[[target_idx]] <- (1 - alpha) * mat_start + alpha * mat_end
-          has_data[target_idx]   <- TRUE
         }
       }
     }
   }
   
-  # 3. Final Output Selection
-  valid_mats <- raw_mats[has_data]
+  # 3. Final Output (Filter out any remaining NULLs at start/end)
+  final_mats <- raw_mats[!vapply(raw_mats, is.null, logical(1))]
   
-  if (length(valid_mats) == 0) return(list(valid=FALSE, reason="No valid data"))
+  if (length(final_mats) == 0) return(list(valid=FALSE, reason="No valid data"))
   
-  list(valid = TRUE, mats = raw_mats, indices = indices, 
-       nr = nrow(valid_mats[[1]]), nc = ncol(valid_mats[[1]]), has_data = has_data)
+  list(valid = TRUE, mats = final_mats, indices = indices, 
+       nr = nrow(final_mats[[1]]), nc = ncol(final_mats[[1]]))
 }
 
 # ---------------------- 4. Core Network Builder ----------------------
@@ -220,7 +206,7 @@ build_networks_for_intervals <- function(cfg) {
   if (length(intervals) == 0) stop("No intervals found")
   
   pool_lbl <- if(cfg$use_pooling) "pool" else "raw"
-  rm_dup_lbl <- if(cfg$remove_duplicates) "sim" else "dup"
+  rm_dup_lbl <- if(cfg$remove_duplicates) "simple" else "complex"
   subdir_name <- sprintf("%s_iou%.2f_move%.2f_dist%.0f_%s", pool_lbl, cfg$iou_threshold, cfg$movement_threshold, cfg$max_match_dist, rm_dup_lbl)
   
   out_png_dir <- file.path(cfg$out_dir, subdir_name, cfg$participant, cfg$gesture, "png")
@@ -239,8 +225,9 @@ build_networks_for_intervals <- function(cfg) {
     all_edges <- list()
     all_active_indices <- integer(0)
     
+    # Loop through contiguous valid matrices
     for (i in 1:(length(mats) - 1)) {
-      if (!seq_data$has_data[i] || !seq_data$has_data[i+1]) next
+      # No need to check has_data, as seq_data$mats only contains valid/interpolated matrices now
       
       mat_t  <- mats[[i]]
       mat_t1 <- mats[[i+1]]
@@ -249,11 +236,9 @@ build_networks_for_intervals <- function(cfg) {
       
       if(length(comps_t) > 0) all_active_indices <- c(all_active_indices, unlist(comps_t))
       
-      # Pre-calculate Centroids for all blobs in both frames
       cents_t  <- lapply(comps_t,  function(c) get_centroid(c, mat_t, nr))
       cents_t1 <- lapply(comps_t1, function(c) get_centroid(c, mat_t1, nr))
       
-      # MATCHING LOGIC
       used_j <- rep(FALSE, length(comps_t1))
       
       for (idx_a in seq_along(comps_t)) {
@@ -271,14 +256,13 @@ build_networks_for_intervals <- function(cfg) {
         if (!is.na(cand_iou) && best_iou > cfg$iou_threshold) {
           matched_idx_b <- cand_iou
         } else {
-          # 2. Fallback Match: Nearest Distance (if IoU failed)
+          # 2. Fallback Match: Nearest Distance
           best_dist <- Inf
           cand_dist <- NA
           c_a <- cents_t[[idx_a]]
           
           for (idx_b in seq_along(comps_t1)) {
-            if (used_j[idx_b]) next # Don't steal already matched blobs
-            
+            if (used_j[idx_b]) next 
             c_b <- cents_t1[[idx_b]]
             dist <- sqrt(sum((c_b - c_a)^2))
             if (dist < best_dist) { best_dist <- dist; cand_dist <- idx_b }
@@ -289,7 +273,6 @@ build_networks_for_intervals <- function(cfg) {
           }
         }
         
-        # PROCEED IF MATCH FOUND
         if (!is.na(matched_idx_b)) {
           used_j[matched_idx_b] <- TRUE
           
@@ -324,14 +307,9 @@ build_networks_for_intervals <- function(cfg) {
     if(length(last_comps) > 0) all_active_indices <- c(all_active_indices, unlist(last_comps))
     all_active_indices <- unique(all_active_indices)
     
-    # --- GRAPH CONSTRUCTION with Duplicate Removal ---
     if (length(all_edges) > 0) {
       edges_mat <- do.call(rbind, all_edges)
-      
-      # NEW LOGIC: Remove Duplicate Edges
-      if (cfg$remove_duplicates) {
-        edges_mat <- unique(edges_mat)
-      }
+      if (cfg$remove_duplicates) edges_mat <- unique(edges_mat)
     } else {
       edges_mat <- matrix(character(0), ncol=2)
     }
@@ -343,7 +321,8 @@ build_networks_for_intervals <- function(cfg) {
     g <- graph_from_data_frame(as.data.frame(edges_mat, stringsAsFactors=FALSE), vertices=V_df, directed=TRUE)
     
     csv_name <- file.path(out_csv_dir, sprintf("int_%03d.csv", k))
-    if(nrow(edges_mat) > 0) utils::write.csv(edges_mat, csv_name, row.names=FALSE)
+    if(nrow(edges_mat) == 0) msg("No edge found in %s: %d -> %d", cfg$gesture, iv[1], iv[2])
+    utils::write.csv(edges_mat, csv_name, row.names=FALSE)
     
     if (cfg$plot_png) {
       png_name <- file.path(out_png_dir, sprintf("int_%03d.png", k))

@@ -4,4 +4,6 @@
 
 # results
 **/networks
-**/networks_flow
+
+# train
+**/train_data
