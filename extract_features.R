@@ -1,5 +1,5 @@
 library(igraph)
-library(e1071) # For skewness/kurtosis
+library(e1071)
 library(dplyr)
 
 # ---------------------- Configuration ----------------------
@@ -10,12 +10,10 @@ CFG <- list(
   output_dir      = "train_data"
 )
 
-# ---------------------- Helpers ----------------------
 msg <- function(...) cat(sprintf(...), "\n")
 
-# Helper to get raw pressure stats for the interval
+# Helper: Raw Stats
 get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
-  # 1. Find timestamp file to get start/end frames
   ts_paths <- c(
     file.path(base_dir, ".data", participant, sprintf("%s_timestamp_merge.txt", gesture)),
     file.path(base_dir, "data",  participant, sprintf("%s_timestamp_merge.txt", gesture)),
@@ -25,103 +23,101 @@ get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
   ts_path <- ts_paths[file.exists(ts_paths)][1]
   if (is.na(ts_path)) return(c(dur=NA, max_p=NA, mean_p=NA))
   
-  # 2. Parse specific interval
   lines <- readLines(ts_path, warn=FALSE)
   valid_lines <- lines[!startsWith(trimws(lines), "#") & nzchar(trimws(lines))]
   
   if (interval_idx > length(valid_lines)) return(c(dur=NA, max_p=NA, mean_p=NA))
-  
   nums <- as.integer(regmatches(valid_lines[interval_idx], gregexpr("\\d+", valid_lines[interval_idx]))[[1]])
   if (length(nums) < 2) return(c(dur=NA, max_p=NA, mean_p=NA))
   
   start_f <- min(nums); end_f <- max(nums)
   duration <- end_f - start_f + 1
   
-  # 3. Scan frames for pressure stats
-  max_vals <- numeric(0)
-  mean_vals <- numeric(0)
-  median_vals <- numeric(0)
-  
-  # We check a subset of frames to be fast, or all if feasible
-  # Let's check all frames in interval
+  max_vals <- numeric(0); mean_vals <- numeric(0); median_vals <- numeric(0);
   for (f in start_f:end_f) {
     fn <- file.path(base_dir, "harsh_process", participant, gesture, sprintf("f%05d.csv", f))
     if (file.exists(fn)) {
       mat <- tryCatch(as.matrix(utils::read.csv(fn, header=FALSE)), error=function(e) NULL)
       if (!is.null(mat)) {
         max_vals <- c(max_vals, max(mat, na.rm=TRUE))
-        mean_vals <- c(mean_vals, mean(mat[mat>0], na.rm=TRUE)) # Mean of active pixels only
-        median_vals <- c(median_vals, median(mat[mat>0], na.rm=TRUE)) # Median of active pixels only
+        mean_vals <- c(mean_vals, mean(mat[mat>0], na.rm=TRUE)) 
+        median_vals <- c(median_vals, median(mat[mat>0], na.rm=TRUE)) 
       }
     }
   }
-  
-  c(
-    duration = duration,
+  c(duration = duration,
     max_pressure = if(length(max_vals)>0) max(max_vals) else 0,
     avg_pressure = if(length(mean_vals)>0) mean(mean_vals, na.rm=TRUE) else 0,
-    median_pressure = if(length(median_vals)>0) median(mean_vals, na.rm=TRUE) else 0
+    median_pressure = if(length(median_vals)>0) median(median_vals, na.rm=TRUE) else 0
   )
 }
 
-# ---------------------- Feature Computation ----------------------
-compute_graph_metrics <- function(csv_path) {
-  # Load Edges
-  edges <- tryCatch(read.csv(csv_path, stringsAsFactors=FALSE), error=function(e) NULL)
+# Helper: Graph Metrics
+compute_graph_metrics <- function(edges_path, nodes_path) {
   
-  # If empty graph
-  if (is.null(edges) || nrow(edges) == 0) {
+  # 1. Load Data
+  edges <- tryCatch(read.csv(edges_path, stringsAsFactors=FALSE), error=function(e) NULL)
+  nodes <- tryCatch(read.csv(nodes_path, stringsAsFactors=FALSE), error=function(e) NULL)
+  
+  # 2. Build Graph (Include isolated active nodes)
+  if (is.null(nodes) || nrow(nodes) == 0) {
+    # If no active nodes, graph is empty
     g <- make_empty_graph(directed=TRUE)
   } else {
-    g <- graph_from_data_frame(edges, directed=TRUE)
+    # If edges empty, ensure it's a valid empty DF
+    if (is.null(edges) || nrow(edges) == 0) {
+      edges <- data.frame(from=character(), to=character())
+    }
+    # Ensure columns match
+    nodes$name <- as.character(nodes$name)
+    edges$from <- as.character(edges$from)
+    edges$to   <- as.character(edges$to)
+    
+    # Construct graph using Nodes explicitly
+    g <- graph_from_data_frame(d = edges, vertices = nodes, directed = TRUE)
   }
   
-  # --- Basic Topology ---
+  # 3. Metrics
   n_nodes <- vcount(g)
   n_edges <- ecount(g)
   density <- edge_density(g)
-  reciprocity <- reciprocity(g) # Crucial for Rub vs Swipe
+  reciprocity <- reciprocity(g) 
+  if(is.na(reciprocity)) reciprocity <- 0
   
-  # --- Component Analysis (Crucial for 1 finger vs 3 fingers) ---
+  # Components
   comps_weak <- components(g, mode="weak")
   n_comps    <- comps_weak$no
   max_comp_sz <- if(n_comps > 0) max(comps_weak$csize) else 0
   
-  # --- Degree Statistics ---
+  # Degrees
   if (n_nodes > 0) {
+    deg_all <- degree(g, mode="all")
     deg_in  <- degree(g, mode="in")
     deg_out <- degree(g, mode="out")
-    deg_all <- degree(g, mode="all")
     
     mean_deg <- mean(deg_all)
     max_deg  <- max(deg_all)
-    sd_deg   <- sd(deg_all)
-    skew_deg <- skewness(deg_all, na.rm=TRUE) # High for Pinch (converging flow)
+    skew_deg <- skewness(deg_all, na.rm=TRUE)
     
-    # Source/Sink Ratio (Flow Directionality)
-    # Source: Out > 0, In = 0. Sink: In > 0, Out = 0.
     n_sources <- sum(deg_out > 0 & deg_in == 0)
     n_sinks   <- sum(deg_in > 0 & deg_out == 0)
-    ratio_source_sink <- if(n_nodes>0) (n_sources + n_sinks) / n_nodes else 0
+    ratio_source_sink <- (n_sources + n_sinks) / n_nodes
   } else {
-    mean_deg <- 0; max_deg <- 0; sd_deg <- 0; skew_deg <- 0
+    mean_deg <- 0; max_deg <- 0; skew_deg <- 0
     n_sources <- 0; n_sinks <- 0; ratio_source_sink <- 0
   }
   
-  # --- Path / Distance Metrics ---
-  # Warning: Shortest paths can be slow on massive graphs, but ours are sparse
+  # Paths (on largest component)
+  avg_path_len <- 0
+  diam <- 0
+  transitivity <- 0
+  
   if (n_nodes > 1 && n_edges > 0) {
-    # Only consider the largest component for meaningful path length
-    giant_g <- induced_subgraph(g, which(components(g, mode="weak")$membership == which.max(components(g, mode="weak")$csize)))
-    
+    giant_g <- induced_subgraph(g, which(comps_weak$membership == which.max(comps_weak$csize)))
     avg_path_len <- mean_distance(giant_g, directed=TRUE)
-    diam         <- diameter(giant_g, directed=TRUE) # High for long Swipes
-    transitivity <- transitivity(giant_g, type="global") # Clustering coefficient
+    diam         <- diameter(giant_g, directed=TRUE) 
+    transitivity <- transitivity(giant_g, type="global")
     if(is.na(transitivity)) transitivity <- 0
-  } else {
-    avg_path_len <- 0
-    diam <- 0
-    transitivity <- 0
   }
   
   list(
@@ -143,55 +139,49 @@ compute_graph_metrics <- function(csv_path) {
   )
 }
 
-# ---------------------- Main Loop ----------------------
 process_all <- function() {
-  # Find all CSVs
-  # Pattern: .../participant/gesture/csv/int_XXX.csv
   input_dir <- file.path(CFG$network_dir, CFG$input_subdir)
-  csv_files <- list.files(input_dir, pattern = "\\.csv$", recursive = TRUE, full.names = TRUE)
+  # Look for EDGES files
+  edge_files <- list.files(input_dir, pattern = "_edges\\.csv$", recursive = TRUE, full.names = TRUE)
   
-  if (length(csv_files) == 0) stop("No CSV files found in ", CFG$input_subdir)
+  if (length(edge_files) == 0) stop("No _edges.csv files found in ", input_dir)
   
   results <- list()
-  
-  msg("Found %d network files. extracting features...", length(csv_files))
+  msg("Found %d edge files. Extracting features...", length(edge_files))
   
   count <- 0
-  for (fpath in csv_files) {
+  for (edge_path in edge_files) {
     count <- count + 1
-    if (count %% 50 == 0) msg("Processed %d / %d", count, length(csv_files))
+    if (count %% 50 == 0) msg("Processed %d / %d", count, length(edge_files))
     
-    # Extract Metadata from path
-    parts <- strsplit(fpath, "/")[[1]]
-    # Assuming structure: ... / Participant / Gesture / csv / int_001.csv
-    # We need to count backwards from the file name
+    # Derive Node Path
+    node_path <- sub("_edges\\.csv$", "_nodes.csv", edge_path)
+    
+    # Metadata
+    parts <- strsplit(edge_path, "/")[[1]]
     fname <- parts[length(parts)]
     gesture <- parts[length(parts) - 2]
     participant <- parts[length(parts) - 3]
     
-    # Extract Interval ID from filename (int_001.csv -> 1)
-    interval_idx <- as.integer(sub("int_003_edges.csv", "", sub("int_", "", sub(".csv", "", fname))))
-    if(is.na(interval_idx)) interval_idx <- 1 # Fallback
+    # ID: int_001_edges.csv -> 1
+    interval_idx <- as.integer(sub("_edges.csv", "", sub("int_", "", fname)))
+    if(is.na(interval_idx)) interval_idx <- 1
     
-    # 1. Compute Graph Metrics
-    g_feats <- compute_graph_metrics(fpath)
+    # 1. Compute
+    g_feats <- compute_graph_metrics(edge_path, node_path)
     
-    # 2. Get Raw Stats (Duration, Pressure)
+    # 2. Raw Stats
     raw_feats <- get_raw_stats(CFG$base_dir, participant, gesture, interval_idx)
     
     # Combine
-    row_data <- c(
+    results[[length(results)+1]] <- c(
       list(participant = participant, gesture = gesture),
       as.list(raw_feats),
       g_feats
     )
-    results[[length(results)+1]] <- row_data
   }
   
-  # Bind to Dataframe
   final_df <- bind_rows(results)
-  
-  # Clean NAs
   final_df[is.na(final_df)] <- 0
   
   dir.create(CFG$output_dir, recursive = TRUE, showWarnings = FALSE)

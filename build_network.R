@@ -22,7 +22,7 @@ CFG <- list(
   png_pointsize      = 14
 )
 
-# ---------------------- 1. Discovery Utilities ----------------------
+# ---------------------- 1. Utilities ----------------------
 msg <- function(...) cat(sprintf(...), "\n")
 
 list_participants <- function(base_dir) {
@@ -78,7 +78,6 @@ parse_intervals <- function(ts_path) {
   intervals
 }
 
-# ---------------------- 2. Image Processing Utilities ----------------------
 pool_2x2 <- function(mat) {
   nr <- nrow(mat); nc <- ncol(mat)
   if (is.null(nr) || nr < 2 || nc < 2) return(mat)
@@ -134,8 +133,6 @@ label_components_4n <- function(mask) {
   comps
 }
 
-# ---------------------- 3. Advanced Logic ----------------------
-
 iou_sets <- function(a, b) {
   if (length(a) == 0 || length(b) == 0) return(0)
   length(intersect(a, b)) / length(unique(c(a, b)))
@@ -156,50 +153,31 @@ load_and_clean_sequence <- function(cfg, start_f, end_f) {
   if (length(indices) < cfg$min_seq_len) return(list(valid = FALSE, reason = "Sequence too short"))
   
   raw_mats <- vector("list", length(indices))
-  
-  # 1. Load Data
   for (i in seq_along(indices)) {
-    # If file exists, it is loaded. No pressure checks.
     raw_mats[[i]] <- read_frame_matrix(cfg, indices[i]) 
   }
   
-  # 2. Multi-Frame Interpolation
-  # Identify valid indices dynamically by checking for NULL
   valid_indices <- which(!vapply(raw_mats, is.null, logical(1)))
-  
   if (length(valid_indices) == 0) return(list(valid = FALSE, reason = "No valid frames"))
   
   if (length(valid_indices) >= 2) {
     for (k in 1:(length(valid_indices) - 1)) {
-      idx1 <- valid_indices[k]
-      idx2 <- valid_indices[k+1]
-      
-      # If gap > 0 (indices are not adjacent)
+      idx1 <- valid_indices[k]; idx2 <- valid_indices[k+1]
       if (idx2 > idx1 + 1) {
-        mat_start <- raw_mats[[idx1]]
-        mat_end   <- raw_mats[[idx2]]
-        gap_len   <- idx2 - idx1
-        
+        mat_start <- raw_mats[[idx1]]; mat_end <- raw_mats[[idx2]]; gap_len <- idx2 - idx1
         for (j in 1:(gap_len - 1)) {
-          target_idx <- idx1 + j
-          alpha <- j / gap_len 
-          # Fill the NULL slot with interpolated matrix
+          target_idx <- idx1 + j; alpha <- j / gap_len 
           raw_mats[[target_idx]] <- (1 - alpha) * mat_start + alpha * mat_end
         }
       }
     }
   }
-  
-  # 3. Final Output (Filter out any remaining NULLs at start/end)
   final_mats <- raw_mats[!vapply(raw_mats, is.null, logical(1))]
-  
   if (length(final_mats) == 0) return(list(valid=FALSE, reason="No valid data"))
-  
-  list(valid = TRUE, mats = final_mats, indices = indices, 
-       nr = nrow(final_mats[[1]]), nc = ncol(final_mats[[1]]))
+  list(valid = TRUE, mats = final_mats, indices = indices, nr = nrow(final_mats[[1]]), nc = ncol(final_mats[[1]]))
 }
 
-# ---------------------- 4. Core Network Builder ----------------------
+# ---------------------- Core Logic ----------------------
 build_networks_for_intervals <- function(cfg) {
   ts_path <- resolve_timestamp_file(cfg$base_dir, cfg$participant, cfg$gesture)
   intervals <- parse_intervals(ts_path)
@@ -223,14 +201,10 @@ build_networks_for_intervals <- function(cfg) {
     nr <- seq_data$nr
     nc <- seq_data$nc
     all_edges <- list()
-    all_active_indices <- integer(0)
+    all_active_indices <- integer(0) # Stores ID of every node that was ever lit up
     
-    # Loop through contiguous valid matrices
     for (i in 1:(length(mats) - 1)) {
-      # No need to check has_data, as seq_data$mats only contains valid/interpolated matrices now
-      
-      mat_t  <- mats[[i]]
-      mat_t1 <- mats[[i+1]]
+      mat_t  <- mats[[i]]; mat_t1 <- mats[[i+1]]
       comps_t  <- label_components_4n(mat_t > 0)
       comps_t1 <- label_components_4n(mat_t1 > 0)
       
@@ -243,10 +217,7 @@ build_networks_for_intervals <- function(cfg) {
       
       for (idx_a in seq_along(comps_t)) {
         matched_idx_b <- NA
-        
-        # 1. Primary Match: IoU
-        best_iou <- -1
-        cand_iou <- NA
+        best_iou <- -1; cand_iou <- NA
         for (idx_b in seq_along(comps_t1)) {
           if (used_j[idx_b]) next
           val <- iou_sets(comps_t[[idx_a]], comps_t1[[idx_b]])
@@ -256,45 +227,29 @@ build_networks_for_intervals <- function(cfg) {
         if (!is.na(cand_iou) && best_iou > cfg$iou_threshold) {
           matched_idx_b <- cand_iou
         } else {
-          # 2. Fallback Match: Nearest Distance
-          best_dist <- Inf
-          cand_dist <- NA
-          c_a <- cents_t[[idx_a]]
-          
+          best_dist <- Inf; cand_dist <- NA; c_a <- cents_t[[idx_a]]
           for (idx_b in seq_along(comps_t1)) {
             if (used_j[idx_b]) next 
             c_b <- cents_t1[[idx_b]]
             dist <- sqrt(sum((c_b - c_a)^2))
             if (dist < best_dist) { best_dist <- dist; cand_dist <- idx_b }
           }
-          
-          if (!is.na(cand_dist) && best_dist < cfg$max_match_dist) {
-            matched_idx_b <- cand_dist
-          }
+          if (!is.na(cand_dist) && best_dist < cfg$max_match_dist) matched_idx_b <- cand_dist
         }
         
         if (!is.na(matched_idx_b)) {
           used_j[matched_idx_b] <- TRUE
-          
-          c_a <- cents_t[[idx_a]]
-          c_b <- cents_t1[[matched_idx_b]]
-          vec <- c_b - c_a
-          magnitude <- sqrt(sum(vec^2))
+          c_a <- cents_t[[idx_a]]; c_b <- cents_t1[[matched_idx_b]]
+          vec <- c_b - c_a; magnitude <- sqrt(sum(vec^2))
           
           if (magnitude > cfg$movement_threshold) {
-            shift_r <- round(vec[1])
-            shift_c <- round(vec[2])
-            
+            shift_r <- round(vec[1]); shift_c <- round(vec[2])
             for (lin_idx in comps_t[[idx_a]]) {
-              r <- ((lin_idx - 1L) %% nr) + 1L
-              c <- ((lin_idx - 1L) %/% nr) + 1L
+              r <- ((lin_idx - 1L) %% nr) + 1L; c <- ((lin_idx - 1L) %/% nr) + 1L
               tr <- r + shift_r; tc <- c + shift_c
-              
-              if (tr >= 1 && tr <= nr && tc >= 1 && tc <= nc) {
-                if (mat_t1[tr, tc] > 0) {
-                  t_lin <- (tc - 1L) * nr + tr
-                  all_edges[[length(all_edges)+1]] <- c(lin_idx, t_lin)
-                }
+              if (tr >= 1 && tr <= nr && tc >= 1 && tc <= nc && mat_t1[tr, tc] > 0) {
+                t_lin <- (tc - 1L) * nr + tr
+                all_edges[[length(all_edges)+1]] <- c(lin_idx, t_lin)
               }
             }
           }
@@ -305,33 +260,47 @@ build_networks_for_intervals <- function(cfg) {
     last_mat <- mats[[length(mats)]]
     last_comps <- label_components_4n(last_mat > 0)
     if(length(last_comps) > 0) all_active_indices <- c(all_active_indices, unlist(last_comps))
-    all_active_indices <- unique(all_active_indices)
     
+    # --- SAVE 1: EDGES ---
+    csv_name_edge <- file.path(out_csv_dir, sprintf("int_%03d_edges.csv", k))
     if (length(all_edges) > 0) {
       edges_mat <- do.call(rbind, all_edges)
       if (cfg$remove_duplicates) edges_mat <- unique(edges_mat)
+      colnames(edges_mat) <- c("from", "to")
+      utils::write.csv(edges_mat, csv_name_edge, row.names=FALSE)
     } else {
+      # Save empty file with headers so extraction doesn't crash
+      utils::write.csv(data.frame(from=character(), to=character()), csv_name_edge, row.names=FALSE)
       edges_mat <- matrix(character(0), ncol=2)
     }
     
-    all_ids <- 1:(nr*nc)
-    rc <- arrayInd(all_ids, .dim = c(nr, nc))
-    V_df <- data.frame(name=as.character(all_ids), x=rc[,2], y=nr-rc[,1]+1)
+    # --- SAVE 2: NODES (Active Indices) ---
+    all_active_indices <- unique(all_active_indices)
+    csv_name_node <- file.path(out_csv_dir, sprintf("int_%03d_nodes.csv", k))
+    # Create DF with node ID
+    if(length(all_active_indices) > 0) {
+      node_df <- data.frame(name = as.character(all_active_indices))
+      utils::write.csv(node_df, csv_name_node, row.names=FALSE)
+    } else {
+      utils::write.csv(data.frame(name=character()), csv_name_node, row.names=FALSE)
+    }
     
-    g <- graph_from_data_frame(as.data.frame(edges_mat, stringsAsFactors=FALSE), vertices=V_df, directed=TRUE)
-    
-    csv_name <- file.path(out_csv_dir, sprintf("int_%03d.csv", k))
-    if(nrow(edges_mat) == 0) msg("No edge found in %s: %d -> %d", cfg$gesture, iv[1], iv[2])
-    utils::write.csv(edges_mat, csv_name, row.names=FALSE)
-    
+    # --- PLOTTING ---
     if (cfg$plot_png) {
       png_name <- file.path(out_png_dir, sprintf("int_%03d.png", k))
       png(png_name, width=cfg$png_width, height=cfg$png_height, pointsize=cfg$png_pointsize)
       
-      is_active <- V(g)$name %in% as.character(all_active_indices)
+      # Visualization Graph
+      all_ids <- 1:(nr*nc)
+      rc <- arrayInd(all_ids, .dim = c(nr, nc))
+      V_df <- data.frame(name=as.character(all_ids), x=rc[,2], y=nr-rc[,1]+1)
+      
+      g_vis <- graph_from_data_frame(as.data.frame(edges_mat, stringsAsFactors=FALSE), vertices=V_df, directed=TRUE)
+      
+      is_active <- V(g_vis)$name %in% as.character(all_active_indices)
       v_cols <- ifelse(is_active, "black", NA)
       
-      plot(g, layout=cbind(V(g)$x, V(g)$y),
+      plot(g_vis, layout=cbind(V(g_vis)$x, V(g_vis)$y),
            vertex.size=3, vertex.label=NA, vertex.color=v_cols, vertex.frame.color=NA,
            edge.arrow.size=0.4, edge.color="red",
            main=sprintf("%s/%s Int %d (Active:%d)", cfg$participant, cfg$gesture, k, length(all_active_indices)))
@@ -339,8 +308,6 @@ build_networks_for_intervals <- function(cfg) {
     }
   }
 }
-
-# ---------------------- 5. Batch Drivers ----------------------
 
 run_one_pair <- function(base_cfg, participant, gesture) {
   run_cfg <- base_cfg
