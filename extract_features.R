@@ -1,19 +1,63 @@
 library(igraph)
-library(e1071)
+library(e1071) # For skewness/kurtosis
 library(dplyr)
+library(grDevices) # For chull
 
 # ---------------------- Configuration ----------------------
 CFG <- list(
   base_dir        = "./../PressureSensorPi/",
   network_dir     = "networks",
-  input_subdir    = "raw_iou0.20_move0.50_dist5_simple",
+  input_subdir    = "raw_iou0.20_move0.90_dist10_simple", 
   output_dir      = "train_data"
 )
 
 msg <- function(...) cat(sprintf(...), "\n")
 
-# Helper: Raw Stats
+# ---------------------- Utilities ----------------------
+
+# Need this for "Blob Counting" on raw frames
+label_components_4n <- function(mask) {
+  nr <- nrow(mask); nc <- ncol(mask)
+  if (nr == 0 || nc == 0) return(list())
+  lab <- matrix(0L, nr, nc)
+  comps <- list(); lab_id <- 0L
+  nbors <- matrix(c(-1,0, 1,0, 0,-1, 0,1), ncol = 2, byrow = TRUE)
+  
+  for (r in 1:nr) {
+    for (c in 1:nc) {
+      if (!mask[r, c] || lab[r, c] != 0L) next
+      lab_id <- lab_id + 1L
+      qr <- integer(nr*nc); qc <- integer(nr*nc); head <- 1L; tail <- 1L
+      qr[tail] <- r; qc[tail] <- c; tail <- tail + 1L
+      lab[r, c] <- lab_id
+      members <- integer(0)
+      while (head < tail) {
+        rr <- qr[head]; cc <- qc[head]; head <- head + 1L
+        members <- c(members, (cc - 1L) * nr + rr)
+        for (k in 1:4) {
+          r2 <- rr + nbors[k, 1]; c2 <- cc + nbors[k, 2]
+          if (r2 >= 1 && r2 <= nr && c2 >= 1 && c2 <= nc && mask[r2, c2] && lab[r2, c2] == 0L) {
+            lab[r2, c2] <- lab_id
+            qr[tail] <- r2; qc[tail] <- c2; tail <- tail + 1L
+          }
+        }
+      }
+      comps[[lab_id]] <- members
+    }
+  }
+  comps
+}
+
+# Calculate Polygon Area from coordinates
+poly_area <- function(x, y) {
+  if (length(x) < 3) return(0)
+  # Shoelace formula
+  0.5 * abs(sum(x * c(y[-1], y[1]) - y * c(x[-1], x[1])))
+}
+
+# ---------------------- 1. Raw Spatio-Temporal Stats ----------------------
 get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
+  # Resolve Timestamp
   ts_paths <- c(
     file.path(base_dir, ".data", participant, sprintf("%s_timestamp_merge.txt", gesture)),
     file.path(base_dir, "data",  participant, sprintf("%s_timestamp_merge.txt", gesture)),
@@ -21,159 +65,263 @@ get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
     file.path(base_dir, "data",  participant, sprintf("%s_timestamp.txt",        gesture))
   )
   ts_path <- ts_paths[file.exists(ts_paths)][1]
-  if (is.na(ts_path)) return(c(dur=NA, max_p=NA, mean_p=NA))
+  if (is.na(ts_path)) return(NULL) # Fail gracefully
   
   lines <- readLines(ts_path, warn=FALSE)
   valid_lines <- lines[!startsWith(trimws(lines), "#") & nzchar(trimws(lines))]
   
-  if (interval_idx > length(valid_lines)) return(c(dur=NA, max_p=NA, mean_p=NA))
+  if (interval_idx > length(valid_lines)) return(NULL)
   nums <- as.integer(regmatches(valid_lines[interval_idx], gregexpr("\\d+", valid_lines[interval_idx]))[[1]])
-  if (length(nums) < 2) return(c(dur=NA, max_p=NA, mean_p=NA))
+  if (length(nums) < 2) return(NULL)
   
   start_f <- min(nums); end_f <- max(nums)
   duration <- end_f - start_f + 1
   
-  max_vals <- numeric(0); mean_vals <- numeric(0); median_vals <- numeric(0);
+  # Accumulators
+  max_vals <- numeric(0)
+  mean_vals <- numeric(0)
+  median_vals <- numeric(0)
+  blob_counts <- numeric(0)
+  
+  # For Persistence & Activation Rate
+  # We need to map 2D (r,c) to 1D index to track them
+  # Assuming 64x64 sensor max, but we'll read dim from first frame
+  seen_nodes <- integer(0)
+  node_activity_counts <- list() # Key=Index, Value=FramesActive
+  
+  # For Physical Area (collect all unique active points)
+  all_active_coords <- list()
+  
+  nr <- 0; nc <- 0
+  
   for (f in start_f:end_f) {
     fn <- file.path(base_dir, "harsh_process", participant, gesture, sprintf("f%05d.csv", f))
     if (file.exists(fn)) {
       mat <- tryCatch(as.matrix(utils::read.csv(fn, header=FALSE)), error=function(e) NULL)
       if (!is.null(mat)) {
-        max_vals <- c(max_vals, max(mat, na.rm=TRUE))
-        mean_vals <- c(mean_vals, mean(mat[mat>0], na.rm=TRUE)) 
-        median_vals <- c(median_vals, median(mat[mat>0], na.rm=TRUE)) 
+        if(nr == 0) { nr <- nrow(mat); nc <- ncol(mat) }
+        
+        # Pressure Stats
+        active_mask <- mat > 0
+        active_vals <- mat[active_mask]
+        
+        if (length(active_vals) > 0) {
+          max_vals <- c(max_vals, max(active_vals))
+          mean_vals <- c(mean_vals, mean(active_vals))
+          median_vals <- c(median_vals, median(active_vals))
+          
+          # Blob Counts
+          comps <- label_components_4n(active_mask)
+          blob_counts <- c(blob_counts, length(comps))
+          
+          # Active Indices this frame
+          active_indices <- which(active_mask)
+          
+          # Track Persistence
+          for(idx in active_indices) {
+            idx_char <- as.character(idx)
+            node_activity_counts[[idx_char]] <- (node_activity_counts[[idx_char]] %||% 0) + 1
+          }
+          
+          # Track Activation
+          new_nodes <- setdiff(active_indices, seen_nodes)
+          seen_nodes <- unique(c(seen_nodes, active_indices))
+          
+          # Track Coords for Area
+          # Convert linear index back to row/col
+          # R is column-major: row = (idx-1)%%nr + 1, col = (idx-1)%/%nr + 1
+          rows <- (active_indices - 1) %% nr + 1
+          cols <- (active_indices - 1) %/% nr + 1
+          
+          # Store as a matrix for this frame
+          all_active_coords[[length(all_active_coords)+1]] <- cbind(rows, cols)
+        } else {
+          # Empty frame
+          blob_counts <- c(blob_counts, 0)
+        }
       }
     }
   }
-  c(duration = duration,
+  
+  # --- Compute Spatio-Temporal Metrics ---
+  
+  # 1. Persistence: Avg frames a node stays active
+  avg_persistence <- if(length(node_activity_counts) > 0) mean(unlist(node_activity_counts)) else 0
+  
+  # 2. Activation Rate: New nodes per frame
+  # (Total unique nodes / Duration)
+  activation_rate <- if(duration > 0) length(seen_nodes) / duration else 0
+  
+  # 3. Physical Area (Convex Hull of ALL active points in interval)
+  hull_area <- 0
+  max_phys_dist <- 0
+  
+  if (length(all_active_coords) > 0) {
+    all_pts <- do.call(rbind, all_active_coords)
+    all_pts <- unique(all_pts) # Dedup coordinates
+    
+    # Convex Hull Area
+    if (nrow(all_pts) >= 3) {
+      hull_idx <- chull(all_pts[,1], all_pts[,2])
+      hull_pts <- all_pts[hull_idx, ]
+      hull_area <- poly_area(hull_pts[,1], hull_pts[,2])
+    }
+    
+    # Max Physical Distance
+    if (nrow(all_pts) >= 2) {
+      dists <- dist(all_pts)
+      max_phys_dist <- max(dists)
+    }
+  }
+  
+  c(
+    duration = duration,
     max_pressure = if(length(max_vals)>0) max(max_vals) else 0,
-    avg_pressure = if(length(mean_vals)>0) mean(mean_vals, na.rm=TRUE) else 0,
-    median_pressure = if(length(median_vals)>0) median(median_vals, na.rm=TRUE) else 0
+    avg_pressure = if(length(mean_vals)>0) mean(mean_vals) else 0,
+    median_pressure = if(length(median_vals)>0) median(median_vals) else 0,
+    avg_blobs    = if(length(blob_counts)>0) mean(blob_counts) else 0,
+    max_blobs    = if(length(blob_counts)>0) max(blob_counts) else 0,
+    persistence  = avg_persistence,
+    activation_rate = activation_rate,
+    contact_area = hull_area,
+    max_phys_dist = max_phys_dist
   )
 }
 
-# Helper: Graph Metrics
+# Helper for list access
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# ---------------------- 2. Advanced Graph Metrics ----------------------
 compute_graph_metrics <- function(edges_path, nodes_path) {
   
-  # 1. Load Data
   edges <- tryCatch(read.csv(edges_path, stringsAsFactors=FALSE), error=function(e) NULL)
   nodes <- tryCatch(read.csv(nodes_path, stringsAsFactors=FALSE), error=function(e) NULL)
   
-  # 2. Build Graph (Include isolated active nodes)
   if (is.null(nodes) || nrow(nodes) == 0) {
-    # If no active nodes, graph is empty
     g <- make_empty_graph(directed=TRUE)
   } else {
-    # If edges empty, ensure it's a valid empty DF
-    if (is.null(edges) || nrow(edges) == 0) {
-      edges <- data.frame(from=character(), to=character())
-    }
-    # Ensure columns match
+    if (is.null(edges) || nrow(edges) == 0) edges <- data.frame(from=character(), to=character())
     nodes$name <- as.character(nodes$name)
     edges$from <- as.character(edges$from)
     edges$to   <- as.character(edges$to)
-    
-    # Construct graph using Nodes explicitly
     g <- graph_from_data_frame(d = edges, vertices = nodes, directed = TRUE)
   }
   
-  # 3. Metrics
   n_nodes <- vcount(g)
   n_edges <- ecount(g)
-  density <- edge_density(g)
-  reciprocity <- reciprocity(g) 
-  if(is.na(reciprocity)) reciprocity <- 0
   
-  # Components
-  comps_weak <- components(g, mode="weak")
-  n_comps    <- comps_weak$no
-  max_comp_sz <- if(n_comps > 0) max(comps_weak$csize) else 0
+  # Default Values
+  res <- list(
+    n_nodes = n_nodes, n_edges = n_edges, density = 0, reciprocity = 0,
+    n_comps = 0, max_comp_sz = 0, scc_count = 0,
+    mean_deg = 0, sd_deg = 0, kurt_deg = 0, max_deg_in = 0, max_deg_out = 0, centralization = 0,
+    mean_betweenness = 0, max_betweenness = 0,
+    mean_closeness = 0, max_closeness = 0,
+    max_hub = 0, max_auth = 0,
+    avg_path_len = 0, diameter = 0, clustering = 0
+  )
   
-  # Degrees
   if (n_nodes > 0) {
+    # Density & Reciprocity
+    res$density <- edge_density(g)
+    rec <- reciprocity(g)
+    res$reciprocity <- if(is.na(rec)) 0 else rec
+    
+    # Components (Weakly Connected - Physical distinct groups)
+    comps <- components(g, mode="weak")
+    res$n_comps <- comps$no
+    res$max_comp_sz <- max(comps$csize)
+    
+    # Strongly Connected Components (Cycles)
+    scc <- components(g, mode="strong")
+    res$scc_count <- scc$no
+    
+    # Degree Stats
     deg_all <- degree(g, mode="all")
     deg_in  <- degree(g, mode="in")
     deg_out <- degree(g, mode="out")
     
-    mean_deg <- mean(deg_all)
-    max_deg  <- max(deg_all)
-    skew_deg <- skewness(deg_all, na.rm=TRUE)
+    res$mean_deg <- mean(deg_all)
+    res$sd_deg   <- sd(deg_all)
+    kurt <- kurtosis(deg_all, na.rm=TRUE)
+    res$kurt_deg <- if(is.nan(kurt)) 0 else kurt
+    res$max_deg_in <- max(deg_in)
+    res$max_deg_out <- max(deg_out)
     
-    n_sources <- sum(deg_out > 0 & deg_in == 0)
-    n_sinks   <- sum(deg_in > 0 & deg_out == 0)
-    ratio_source_sink <- (n_sources + n_sinks) / n_nodes
-  } else {
-    mean_deg <- 0; max_deg <- 0; skew_deg <- 0
-    n_sources <- 0; n_sinks <- 0; ratio_source_sink <- 0
+    # Centralization (Degree)
+    centr <- centr_degree(g, mode="all")$centralization
+    res$centralization <- if(is.na(centr)) 0 else centr
+    
+    # Betweenness Centrality
+    # (Normalized to compare graphs of different sizes)
+    bw <- betweenness(g, normalized = TRUE)
+    res$mean_betweenness <- mean(bw)
+    res$max_betweenness  <- max(bw)
+    
+    # Closeness Centrality
+    cl <- closeness(g, normalized = TRUE) # Output can be NaN for disconnected
+    cl[is.nan(cl)] <- 0
+    res$mean_closeness <- mean(cl)
+    res$max_closeness  <- max(cl)
+    
+    # Hub / Authority (HITS)
+    # Handle case where algorithm fails on tiny graphs
+    try({
+      hs <- hub_score(g)$vector
+      as <- authority_score(g)$vector
+      res$max_hub <- if(length(hs)>0) max(hs) else 0
+      res$max_auth <- if(length(as)>0) max(as) else 0
+    }, silent=TRUE)
+    
+    # Path Metrics (on Giant Component)
+    if (n_edges > 0) {
+      giant_g <- induced_subgraph(g, which(comps$membership == which.max(comps$csize)))
+      res$avg_path_len <- mean_distance(giant_g, directed=TRUE)
+      res$diameter     <- diameter(giant_g, directed=TRUE)
+      tr <- transitivity(giant_g, type="global")
+      res$clustering   <- if(is.na(tr)) 0 else tr
+    }
   }
   
-  # Paths (on largest component)
-  avg_path_len <- 0
-  diam <- 0
-  transitivity <- 0
-  
-  if (n_nodes > 1 && n_edges > 0) {
-    giant_g <- induced_subgraph(g, which(comps_weak$membership == which.max(comps_weak$csize)))
-    avg_path_len <- mean_distance(giant_g, directed=TRUE)
-    diam         <- diameter(giant_g, directed=TRUE) 
-    transitivity <- transitivity(giant_g, type="global")
-    if(is.na(transitivity)) transitivity <- 0
-  }
-  
-  list(
-    n_nodes = n_nodes,
-    n_edges = n_edges,
-    density = density,
-    reciprocity = reciprocity,
-    n_comps = n_comps,
-    max_comp_sz = max_comp_sz,
-    mean_deg = mean_deg,
-    max_deg = max_deg,
-    skew_deg = ifelse(is.nan(skew_deg), 0, skew_deg),
-    n_sources = n_sources,
-    n_sinks = n_sinks,
-    ratio_source_sink = ratio_source_sink,
-    avg_path_len = avg_path_len,
-    diameter = diam,
-    clustering = transitivity
-  )
+  return(res)
 }
 
+# ---------------------- Main Loop ----------------------
 process_all <- function() {
   input_dir <- file.path(CFG$network_dir, CFG$input_subdir)
-  # Look for EDGES files
   edge_files <- list.files(input_dir, pattern = "_edges\\.csv$", recursive = TRUE, full.names = TRUE)
   
   if (length(edge_files) == 0) stop("No _edges.csv files found in ", input_dir)
   
   results <- list()
-  msg("Found %d edge files. Extracting features...", length(edge_files))
+  msg("Found %d edge files. Extracting extended features...", length(edge_files))
   
   count <- 0
   for (edge_path in edge_files) {
     count <- count + 1
-    if (count %% 50 == 0) msg("Processed %d / %d", count, length(edge_files))
+    if (count %% 20 == 0) msg("Processed %d / %d", count, length(edge_files))
     
-    # Derive Node Path
+    # Path Parsing
     node_path <- sub("_edges\\.csv$", "_nodes.csv", edge_path)
-    
-    # Metadata
     parts <- strsplit(edge_path, "/")[[1]]
     fname <- parts[length(parts)]
     gesture <- parts[length(parts) - 2]
     participant <- parts[length(parts) - 3]
     
-    # ID: int_001_edges.csv -> 1
     interval_idx <- as.integer(sub("_edges.csv", "", sub("int_", "", fname)))
     if(is.na(interval_idx)) interval_idx <- 1
     
-    # 1. Compute
+    # 1. Graph Metrics
     g_feats <- compute_graph_metrics(edge_path, node_path)
     
-    # 2. Raw Stats
+    # 2. Spatio-Temporal Metrics
     raw_feats <- get_raw_stats(CFG$base_dir, participant, gesture, interval_idx)
+    if(is.null(raw_feats)) {
+      # Fallback if raw data missing
+      raw_feats <- list(duration=0, max_pressure=0, avg_pressure=0, median_pressure=0, avg_blobs=0, max_blobs=0, 
+                        persistence=0, activation_rate=0, contact_area=0, max_phys_dist=0)
+    }
     
-    # Combine
     results[[length(results)+1]] <- c(
       list(participant = participant, gesture = gesture),
       as.list(raw_feats),
@@ -185,9 +333,9 @@ process_all <- function() {
   final_df[is.na(final_df)] <- 0
   
   dir.create(CFG$output_dir, recursive = TRUE, showWarnings = FALSE)
-  out_file <- sprintf("%s/%s.csv", CFG$output_dir, CFG$input_subdir)
+  out_file <- sprintf("%s/%s_features_extended.csv", CFG$output_dir, basename(CFG$input_subdir))
   write.csv(final_df, out_file, row.names = FALSE)
-  msg("Done! Features saved to %s", out_file)
+  msg("Done! Extended features saved to %s", out_file)
 }
 
 process_all()

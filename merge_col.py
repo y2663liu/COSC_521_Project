@@ -2,7 +2,7 @@ import pandas as pd
 
 # Load the CSV file
 folder = "train_data"
-file = "raw_iou0.20_move0.50_dist20_simple"
+file = "raw_iou0.20_move0.90_dist10_simple_features_extended"
 df = pd.read_csv(f"{folder}/{file}.csv")
 
 # Replace gesture labels

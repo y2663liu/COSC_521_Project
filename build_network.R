@@ -10,8 +10,8 @@ CFG <- list(
   
   # --- Network / Flow Params ---
   iou_threshold      = 0.20,           # 1. Primary Match: Min Overlap to match blobs
-  max_match_dist     = 5.0,           # 2. Fallback Match: Max Distance (pixels) if IoU is 0
-  movement_threshold = 0.5,            # Min pixel shift to draw edge (Filters stationary)
+  max_match_dist     = 10.0,           # 2. Fallback Match: Max Distance (pixels) if IoU is 0
+  movement_threshold = 0.9,            # Min pixel shift to draw edge (Filters stationary)
   remove_duplicates  = TRUE,           # If TRUE, identical edges (A->B) occurring at different times are merged
   
   # --- Output Params ---
