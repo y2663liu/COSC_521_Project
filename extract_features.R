@@ -40,6 +40,7 @@ get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
   # 3. Scan frames for pressure stats
   max_vals <- numeric(0)
   mean_vals <- numeric(0)
+  median_vals <- numeric(0)
   
   # We check a subset of frames to be fast, or all if feasible
   # Let's check all frames in interval
@@ -50,6 +51,7 @@ get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
       if (!is.null(mat)) {
         max_vals <- c(max_vals, max(mat, na.rm=TRUE))
         mean_vals <- c(mean_vals, mean(mat[mat>0], na.rm=TRUE)) # Mean of active pixels only
+        median_vals <- c(median_vals, median(mat[mat>0], na.rm=TRUE)) # Median of active pixels only
       }
     }
   }
@@ -57,7 +59,8 @@ get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
   c(
     duration = duration,
     max_pressure = if(length(max_vals)>0) max(max_vals) else 0,
-    avg_pressure = if(length(mean_vals)>0) mean(mean_vals) else 0
+    avg_pressure = if(length(mean_vals)>0) mean(mean_vals, na.rm=TRUE) else 0,
+    median_pressure = if(length(median_vals)>0) median(mean_vals, na.rm=TRUE) else 0
   )
 }
 
