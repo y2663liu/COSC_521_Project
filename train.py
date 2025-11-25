@@ -1,13 +1,11 @@
 """Train gesture classifiers using graph metrics.
 
 This script performs two types of validation:
-1. In-Subject (Random Split): Randomly shuffles all data. Tests if the model 
-   understands the gesture physics generally, but may overfit to specific users.
-   Default test size: 0.1 (10%).
+1. In-Subject (Random Split): Tests physics generalization.
+2. Cross-Subject (Group Split): Tests new user generalization.
 
-2. Cross-Subject (Group Split): Holds out specific participants entirely. 
-   Tests if the model generalizes to new users it has never seen before.
-   Default hold-out: 1 participant.
+It generates a Feature Importance Report AFTER training to help identify 
+key metrics vs. noise.
 """
 from __future__ import annotations
 
@@ -18,6 +16,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -29,13 +28,15 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.svm import LinearSVC
 
+# Force scikit-learn to keep pandas column names through the pipeline
+sklearn.set_config(transform_output="pandas")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "data",
         type=Path,
-        default=Path("train_data/raw_iou0.20_move0.90_dist10_simple_features_extended.csv"),
+        default=Path("train_data/raw_iou0.20_move0.90_dist10_simple_features_extended_rewritten.csv"),
         nargs="?",
         help="Path to the feature CSV.",
     )
@@ -78,7 +79,7 @@ def load_dataset(path: Path, label_col: str, group_col: str) -> Tuple[pd.DataFra
 
     df = pd.read_csv(path)
 
-    # 1. Header Cleaning: Check if first row looks like a duplicate header
+    # 1. Header Cleaning
     if not df.empty:
         cols_norm = [str(c).strip().lower() for c in df.columns]
         first_norm = [str(v).strip().lower() for v in df.iloc[0]]
@@ -94,11 +95,9 @@ def load_dataset(path: Path, label_col: str, group_col: str) -> Tuple[pd.DataFra
         raise ValueError(f"Group column '{group_col}' not found. Required for cross-subject validation.")
 
     # 3. Extraction
-    # Automatically detect classes from data (No filtered list)
     labels = df[label_col].astype(str)
     groups = df[group_col].astype(str)
     
-    # Drop labels and groups from features. 
     cols_to_drop = {label_col, group_col, "interval"}
     feature_cols = [c for c in df.columns if c not in cols_to_drop]
     
@@ -117,15 +116,53 @@ def build_pipeline(model) -> Pipeline:
     """Creates a robust preprocessing and training pipeline."""
     preprocessing = Pipeline(
         steps=[
-            # Impute missing values (e.g. if a graph metric is NaN)
             ("impute", SimpleImputer(strategy="median")), 
-            # Remove constant features (variance == 0)
             ("var_thresh", VarianceThreshold(threshold=0)), 
-            # Standardize (Mean=0, Var=1) - CRITICAL for Normalization
             ("scale", StandardScaler()),
         ]
     )
     return Pipeline(steps=[("pre", preprocessing), ("model", model)])
+
+
+def report_feature_importance(pipeline: Pipeline, model_name: str):
+    """Extracts and prints feature importance from trained models."""
+    
+    # We need to get the feature names coming OUT of the preprocessor
+    # (Because VarianceThreshold might have dropped some columns)
+    try:
+        preprocessor = pipeline.named_steps["pre"]
+        feature_names = preprocessor.get_feature_names_out()
+        
+        model = pipeline.named_steps["model"]
+        
+        importances = None
+        imp_type = ""
+
+        # Strategy 1: Tree-based Importance (Random Forest)
+        if hasattr(model, "feature_importances_"):
+            importances = model.feature_importances_
+            imp_type = "Gini Importance"
+            
+        # Strategy 2: Linear Model Coefficients (Logistic Regression / SVM)
+        elif hasattr(model, "coef_"):
+            # coef_ is shape (n_classes, n_features). We take the mean absolute value across classes.
+            importances = np.mean(np.abs(model.coef_), axis=0)
+            imp_type = "Mean Abs Coefficient"
+
+        if importances is not None:
+            df_imp = pd.DataFrame({"Feature": feature_names, "Importance": importances})
+            df_imp = df_imp.sort_values(by="Importance", ascending=False).reset_index(drop=True)
+            
+            print(f"\n--- {model_name} Feature Analysis ({imp_type}) ---")
+            print("TOP 15 KEY METRICS:")
+            print(df_imp.head(15))
+            
+            print("\nBOTTOM 10 UNIMPORTANT METRICS (Candidates for filtering):")
+            print(df_imp.tail(10))
+            print("-" * 40)
+            
+    except Exception as e:
+        print(f"Could not extract feature importance for {model_name}: {e}")
 
 
 def run_evaluation(
@@ -147,32 +184,30 @@ def run_evaluation(
         print("Error: Split resulted in empty train or test set. Skipping.")
         return
 
-    # UPDATED: Added class_weight="balanced" to automatically reweight samples
     models = {
         "LogReg": LogisticRegression(
             max_iter=2000, 
             multi_class="auto", 
             solver='lbfgs',
-            class_weight="balanced"  # <--- Balances gesture counts
+            class_weight="balanced"
         ),
         "LinearSVM": LinearSVC(
             dual="auto", 
             max_iter=2000,
-            class_weight="balanced"  # <--- Balances gesture counts
+            class_weight="balanced"
         ),
         "RandomForest": RandomForestClassifier(
             n_estimators=100, 
             max_depth=None, 
             random_state=random_state,
-            class_weight="balanced"  # <--- Balances gesture counts
+            class_weight="balanced"
         ),
         "MLP (Neural Net)": MLPClassifier(
             hidden_layer_sizes=(64,),
             activation="relu",
-            max_iter=300,
+            max_iter=2000,
             alpha=1e-3,
             random_state=random_state,
-            # Note: MLPClassifier does not support class_weight="balanced" natively in sklearn
         ),
     }
 
@@ -190,6 +225,11 @@ def run_evaluation(
             print(f"Accuracy: {acc:.2%}")
             print(f"Macro F1: {f1:.3f}")
             
+            # --- Feature Importance Reporting ---
+            # We report this mainly for Random Forest (Non-linear) and LogReg (Linear)
+            if name in ["RandomForest", "LogReg"]:
+                report_feature_importance(pipe, name)
+
             labels = np.unique(np.concatenate((y_test, preds)))
             cm = confusion_matrix(y_test, preds, labels=labels)
             cm_df = pd.DataFrame(cm, index=labels, columns=labels)
