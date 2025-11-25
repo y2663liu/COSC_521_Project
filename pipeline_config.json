@@ -3,11 +3,11 @@
   "network_dir": "networks",
   "feature_dir": "train_data",
   
-  "use_pooling": false,
+  "use_pooling": true,
   "min_seq_len": 10,
   
   "iou_threshold": 0.20,
-  "max_match_dist": 5.0,
+  "max_match_dist": 3.0,
   "movement_threshold": 0.5,
   "remove_duplicates": true,
   
