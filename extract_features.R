@@ -7,7 +7,7 @@ library(grDevices) # For chull
 CFG <- list(
   base_dir        = "./../PressureSensorPi/",
   network_dir     = "networks",
-  input_subdir    = "raw_iou0.20_move0.90_dist10_simple", 
+  input_subdir    = "raw_iou0.20_move0.50_dist5_simple", 
   output_dir      = "train_data"
 )
 
@@ -15,7 +15,6 @@ msg <- function(...) cat(sprintf(...), "\n")
 
 # ---------------------- Utilities ----------------------
 
-# Need this for "Blob Counting" on raw frames
 label_components_4n <- function(mask) {
   nr <- nrow(mask); nc <- ncol(mask)
   if (nr == 0 || nc == 0) return(list())
@@ -48,16 +47,13 @@ label_components_4n <- function(mask) {
   comps
 }
 
-# Calculate Polygon Area from coordinates
 poly_area <- function(x, y) {
   if (length(x) < 3) return(0)
-  # Shoelace formula
   0.5 * abs(sum(x * c(y[-1], y[1]) - y * c(x[-1], x[1])))
 }
 
 # ---------------------- 1. Raw Spatio-Temporal Stats ----------------------
 get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
-  # Resolve Timestamp
   ts_paths <- c(
     file.path(base_dir, ".data", participant, sprintf("%s_timestamp_merge.txt", gesture)),
     file.path(base_dir, "data",  participant, sprintf("%s_timestamp_merge.txt", gesture)),
@@ -65,7 +61,7 @@ get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
     file.path(base_dir, "data",  participant, sprintf("%s_timestamp.txt",        gesture))
   )
   ts_path <- ts_paths[file.exists(ts_paths)][1]
-  if (is.na(ts_path)) return(NULL) # Fail gracefully
+  if (is.na(ts_path)) return(NULL) 
   
   lines <- readLines(ts_path, warn=FALSE)
   valid_lines <- lines[!startsWith(trimws(lines), "#") & nzchar(trimws(lines))]
@@ -77,19 +73,13 @@ get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
   start_f <- min(nums); end_f <- max(nums)
   duration <- end_f - start_f + 1
   
-  # Accumulators
   max_vals <- numeric(0)
   mean_vals <- numeric(0)
   median_vals <- numeric(0)
   blob_counts <- numeric(0)
   
-  # For Persistence & Activation Rate
-  # We need to map 2D (r,c) to 1D index to track them
-  # Assuming 64x64 sensor max, but we'll read dim from first frame
   seen_nodes <- integer(0)
-  node_activity_counts <- list() # Key=Index, Value=FramesActive
-  
-  # For Physical Area (collect all unique active points)
+  node_activity_counts <- list() 
   all_active_coords <- list()
   
   nr <- 0; nc <- 0
@@ -101,7 +91,6 @@ get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
       if (!is.null(mat)) {
         if(nr == 0) { nr <- nrow(mat); nc <- ncol(mat) }
         
-        # Pressure Stats
         active_mask <- mat > 0
         active_vals <- mat[active_mask]
         
@@ -110,64 +99,45 @@ get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
           mean_vals <- c(mean_vals, mean(active_vals))
           median_vals <- c(median_vals, median(active_vals))
           
-          # Blob Counts
           comps <- label_components_4n(active_mask)
           blob_counts <- c(blob_counts, length(comps))
           
-          # Active Indices this frame
           active_indices <- which(active_mask)
           
-          # Track Persistence
           for(idx in active_indices) {
             idx_char <- as.character(idx)
             node_activity_counts[[idx_char]] <- (node_activity_counts[[idx_char]] %||% 0) + 1
           }
           
-          # Track Activation
           new_nodes <- setdiff(active_indices, seen_nodes)
           seen_nodes <- unique(c(seen_nodes, active_indices))
           
-          # Track Coords for Area
-          # Convert linear index back to row/col
-          # R is column-major: row = (idx-1)%%nr + 1, col = (idx-1)%/%nr + 1
           rows <- (active_indices - 1) %% nr + 1
           cols <- (active_indices - 1) %/% nr + 1
-          
-          # Store as a matrix for this frame
           all_active_coords[[length(all_active_coords)+1]] <- cbind(rows, cols)
         } else {
-          # Empty frame
           blob_counts <- c(blob_counts, 0)
         }
       }
     }
   }
   
-  # --- Compute Spatio-Temporal Metrics ---
-  
-  # 1. Persistence: Avg frames a node stays active
   avg_persistence <- if(length(node_activity_counts) > 0) mean(unlist(node_activity_counts)) else 0
-  
-  # 2. Activation Rate: New nodes per frame
-  # (Total unique nodes / Duration)
   activation_rate <- if(duration > 0) length(seen_nodes) / duration else 0
   
-  # 3. Physical Area (Convex Hull of ALL active points in interval)
   hull_area <- 0
   max_phys_dist <- 0
   
   if (length(all_active_coords) > 0) {
     all_pts <- do.call(rbind, all_active_coords)
-    all_pts <- unique(all_pts) # Dedup coordinates
+    all_pts <- unique(all_pts) 
     
-    # Convex Hull Area
     if (nrow(all_pts) >= 3) {
       hull_idx <- chull(all_pts[,1], all_pts[,2])
       hull_pts <- all_pts[hull_idx, ]
       hull_area <- poly_area(hull_pts[,1], hull_pts[,2])
     }
     
-    # Max Physical Distance
     if (nrow(all_pts) >= 2) {
       dists <- dist(all_pts)
       max_phys_dist <- max(dists)
@@ -188,7 +158,6 @@ get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
   )
 }
 
-# Helper for list access
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
 # ---------------------- 2. Advanced Graph Metrics ----------------------
@@ -218,25 +187,21 @@ compute_graph_metrics <- function(edges_path, nodes_path) {
     mean_betweenness = 0, max_betweenness = 0,
     mean_closeness = 0, max_closeness = 0,
     max_hub = 0, max_auth = 0,
-    avg_path_len = 0, diameter = 0, clustering = 0
+    avg_path_len = 0, median_path_len = 0, diameter = 0, clustering = 0
   )
   
   if (n_nodes > 0) {
-    # Density & Reciprocity
     res$density <- edge_density(g)
     rec <- reciprocity(g)
     res$reciprocity <- if(is.na(rec)) 0 else rec
     
-    # Components (Weakly Connected - Physical distinct groups)
     comps <- components(g, mode="weak")
     res$n_comps <- comps$no
     res$max_comp_sz <- max(comps$csize)
     
-    # Strongly Connected Components (Cycles)
     scc <- components(g, mode="strong")
     res$scc_count <- scc$no
     
-    # Degree Stats
     deg_all <- degree(g, mode="all")
     deg_in  <- degree(g, mode="in")
     deg_out <- degree(g, mode="out")
@@ -248,24 +213,18 @@ compute_graph_metrics <- function(edges_path, nodes_path) {
     res$max_deg_in <- max(deg_in)
     res$max_deg_out <- max(deg_out)
     
-    # Centralization (Degree)
     centr <- centr_degree(g, mode="all")$centralization
     res$centralization <- if(is.na(centr)) 0 else centr
     
-    # Betweenness Centrality
-    # (Normalized to compare graphs of different sizes)
     bw <- betweenness(g, normalized = TRUE)
     res$mean_betweenness <- mean(bw)
     res$max_betweenness  <- max(bw)
     
-    # Closeness Centrality
-    cl <- closeness(g, normalized = TRUE) # Output can be NaN for disconnected
+    cl <- closeness(g, normalized = TRUE)
     cl[is.nan(cl)] <- 0
     res$mean_closeness <- mean(cl)
     res$max_closeness  <- max(cl)
     
-    # Hub / Authority (HITS)
-    # Handle case where algorithm fails on tiny graphs
     try({
       hs <- hub_score(g)$vector
       as <- authority_score(g)$vector
@@ -273,13 +232,26 @@ compute_graph_metrics <- function(edges_path, nodes_path) {
       res$max_auth <- if(length(as)>0) max(as) else 0
     }, silent=TRUE)
     
-    # Path Metrics (on Giant Component)
+    # --- PATH METRICS ---
     if (n_edges > 0) {
+      # 1. Extract Giant Component (to avoid Infinite distances from disconnected parts)
       giant_g <- induced_subgraph(g, which(comps$membership == which.max(comps$csize)))
-      res$avg_path_len <- mean_distance(giant_g, directed=TRUE)
-      res$diameter     <- diameter(giant_g, directed=TRUE)
+      
+      # 2. Get Full Distance Matrix for Giant Component
+      # mode="out" follows direction of flow
+      d_mat <- distances(giant_g, mode="out")
+      
+      # 3. Filter valid paths (remove Inf and diagonal 0s)
+      valid_dists <- d_mat[is.finite(d_mat) & d_mat > 0]
+      
+      if(length(valid_dists) > 0) {
+        res$avg_path_len    <- mean(valid_dists)
+        res$median_path_len <- median(valid_dists)
+        res$diameter        <- max(valid_dists)
+      }
+      
       tr <- transitivity(giant_g, type="global")
-      res$clustering   <- if(is.na(tr)) 0 else tr
+      res$clustering <- if(is.na(tr)) 0 else tr
     }
   }
   
@@ -301,7 +273,6 @@ process_all <- function() {
     count <- count + 1
     if (count %% 20 == 0) msg("Processed %d / %d", count, length(edge_files))
     
-    # Path Parsing
     node_path <- sub("_edges\\.csv$", "_nodes.csv", edge_path)
     parts <- strsplit(edge_path, "/")[[1]]
     fname <- parts[length(parts)]
@@ -311,13 +282,10 @@ process_all <- function() {
     interval_idx <- as.integer(sub("_edges.csv", "", sub("int_", "", fname)))
     if(is.na(interval_idx)) interval_idx <- 1
     
-    # 1. Graph Metrics
     g_feats <- compute_graph_metrics(edge_path, node_path)
     
-    # 2. Spatio-Temporal Metrics
     raw_feats <- get_raw_stats(CFG$base_dir, participant, gesture, interval_idx)
     if(is.null(raw_feats)) {
-      # Fallback if raw data missing
       raw_feats <- list(duration=0, max_pressure=0, avg_pressure=0, median_pressure=0, avg_blobs=0, max_blobs=0, 
                         persistence=0, activation_rate=0, contact_area=0, max_phys_dist=0)
     }
