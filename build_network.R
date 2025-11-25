@@ -1,25 +1,24 @@
 library(igraph)
+library(jsonlite)
 
-# ---------------------- Configuration ----------------------
+# ---------------------- Load Configuration ----------------------
+CONFIG_FILE <- "pipeline_config.json"
+if (!file.exists(CONFIG_FILE)) stop("pipeline_config.json not found!")
+params <- fromJSON(CONFIG_FILE)
+
 CFG <- list(
-  base_dir           = "./../PressureSensorPi/",
-  
-  # --- Pre-processing Params ---
-  use_pooling        = FALSE,          # TRUE = 2x2 Max Pool (20x20), FALSE = Raw (40x40)
-  min_seq_len        = 10,             # Filter: Min frames for valid sequence
-  
-  # --- Network / Flow Params ---
-  iou_threshold      = 0.20,           # 1. Primary Match: Min Overlap to match blobs
-  max_match_dist     = 10.0,           # 2. Fallback Match: Max Distance (pixels) if IoU is 0
-  movement_threshold = 0.9,            # Min pixel shift to draw edge (Filters stationary)
-  remove_duplicates  = TRUE,           # If TRUE, identical edges (A->B) occurring at different times are merged
-  
-  # --- Output Params ---
-  out_dir            = "networks",
-  plot_png           = TRUE,
-  png_width          = 1200,
-  png_height         = 900,
-  png_pointsize      = 14
+  base_dir           = params$base_dir,
+  use_pooling        = params$use_pooling,
+  min_seq_len        = params$min_seq_len,
+  iou_threshold      = params$iou_threshold,
+  max_match_dist     = params$max_match_dist,
+  movement_threshold = params$movement_threshold,
+  remove_duplicates  = params$remove_duplicates,
+  out_dir            = params$network_dir,
+  plot_png           = params$plot_png,
+  png_width          = params$png_width,
+  png_height         = params$png_height,
+  png_pointsize      = params$png_pointsize
 )
 
 # ---------------------- 1. Utilities ----------------------
@@ -201,7 +200,7 @@ build_networks_for_intervals <- function(cfg) {
     nr <- seq_data$nr
     nc <- seq_data$nc
     all_edges <- list()
-    all_active_indices <- integer(0) # Stores ID of every node that was ever lit up
+    all_active_indices <- integer(0) 
     
     for (i in 1:(length(mats) - 1)) {
       mat_t  <- mats[[i]]; mat_t1 <- mats[[i+1]]
@@ -261,7 +260,6 @@ build_networks_for_intervals <- function(cfg) {
     last_comps <- label_components_4n(last_mat > 0)
     if(length(last_comps) > 0) all_active_indices <- c(all_active_indices, unlist(last_comps))
     
-    # --- SAVE 1: EDGES ---
     csv_name_edge <- file.path(out_csv_dir, sprintf("int_%03d_edges.csv", k))
     if (length(all_edges) > 0) {
       edges_mat <- do.call(rbind, all_edges)
@@ -269,15 +267,12 @@ build_networks_for_intervals <- function(cfg) {
       colnames(edges_mat) <- c("from", "to")
       utils::write.csv(edges_mat, csv_name_edge, row.names=FALSE)
     } else {
-      # Save empty file with headers so extraction doesn't crash
       utils::write.csv(data.frame(from=character(), to=character()), csv_name_edge, row.names=FALSE)
       edges_mat <- matrix(character(0), ncol=2)
     }
     
-    # --- SAVE 2: NODES (Active Indices) ---
     all_active_indices <- unique(all_active_indices)
     csv_name_node <- file.path(out_csv_dir, sprintf("int_%03d_nodes.csv", k))
-    # Create DF with node ID
     if(length(all_active_indices) > 0) {
       node_df <- data.frame(name = as.character(all_active_indices))
       utils::write.csv(node_df, csv_name_node, row.names=FALSE)
@@ -285,12 +280,10 @@ build_networks_for_intervals <- function(cfg) {
       utils::write.csv(data.frame(name=character()), csv_name_node, row.names=FALSE)
     }
     
-    # --- PLOTTING ---
     if (cfg$plot_png) {
       png_name <- file.path(out_png_dir, sprintf("int_%03d.png", k))
       png(png_name, width=cfg$png_width, height=cfg$png_height, pointsize=cfg$png_pointsize)
       
-      # Visualization Graph
       all_ids <- 1:(nr*nc)
       rc <- arrayInd(all_ids, .dim = c(nr, nc))
       V_df <- data.frame(name=as.character(all_ids), x=rc[,2], y=nr-rc[,1]+1)

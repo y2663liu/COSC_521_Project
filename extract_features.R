@@ -2,16 +2,36 @@ library(igraph)
 library(e1071) # For skewness/kurtosis
 library(dplyr)
 library(grDevices) # For chull
+library(jsonlite)
 
-# ---------------------- Configuration ----------------------
+# ---------------------- Load Configuration ----------------------
+CONFIG_FILE <- "pipeline_config.json"
+if (!file.exists(CONFIG_FILE)) stop("pipeline_config.json not found!")
+params <- fromJSON(CONFIG_FILE)
+
+# Reconstruct the directory name logic to match build_network.R
+pool_lbl <- if(params$use_pooling) "pool" else "raw"
+rm_dup_lbl <- if(params$remove_duplicates) "simple" else "complex"
+
+# Format: raw_iou0.20_move0.90_dist20_simple
+generated_subdir <- sprintf("%s_iou%.2f_move%.2f_dist%.0f_%s", 
+                            pool_lbl, 
+                            params$iou_threshold, 
+                            params$movement_threshold, 
+                            params$max_match_dist, 
+                            rm_dup_lbl)
+
 CFG <- list(
-  base_dir        = "./../PressureSensorPi/",
-  network_dir     = "networks",
-  input_subdir    = "raw_iou0.20_move0.50_dist5_simple", 
-  output_dir      = "train_data"
+  base_dir        = params$base_dir,
+  network_dir     = params$network_dir,
+  input_subdir    = generated_subdir, 
+  output_dir      = params$feature_dir
 )
 
 msg <- function(...) cat(sprintf(...), "\n")
+msg("--- Configuration Loaded ---")
+msg("Input Subdirectory: %s", CFG$input_subdir)
+msg("Output Directory:   %s", CFG$output_dir)
 
 # ---------------------- Utilities ----------------------
 
@@ -52,7 +72,6 @@ poly_area <- function(x, y) {
   0.5 * abs(sum(x * c(y[-1], y[1]) - y * c(x[-1], x[1])))
 }
 
-# ---------------------- 1. Raw Spatio-Temporal Stats ----------------------
 get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
   ts_paths <- c(
     file.path(base_dir, ".data", participant, sprintf("%s_timestamp_merge.txt", gesture)),
@@ -160,7 +179,6 @@ get_raw_stats <- function(base_dir, participant, gesture, interval_idx) {
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
-# ---------------------- 2. Advanced Graph Metrics ----------------------
 compute_graph_metrics <- function(edges_path, nodes_path) {
   
   edges <- tryCatch(read.csv(edges_path, stringsAsFactors=FALSE), error=function(e) NULL)
@@ -179,7 +197,6 @@ compute_graph_metrics <- function(edges_path, nodes_path) {
   n_nodes <- vcount(g)
   n_edges <- ecount(g)
   
-  # Default Values
   res <- list(
     n_nodes = n_nodes, n_edges = n_edges, density = 0, reciprocity = 0,
     n_comps = 0, max_comp_sz = 0, scc_count = 0,
@@ -234,14 +251,8 @@ compute_graph_metrics <- function(edges_path, nodes_path) {
     
     # --- PATH METRICS ---
     if (n_edges > 0) {
-      # 1. Extract Giant Component (to avoid Infinite distances from disconnected parts)
       giant_g <- induced_subgraph(g, which(comps$membership == which.max(comps$csize)))
-      
-      # 2. Get Full Distance Matrix for Giant Component
-      # mode="out" follows direction of flow
       d_mat <- distances(giant_g, mode="out")
-      
-      # 3. Filter valid paths (remove Inf and diagonal 0s)
       valid_dists <- d_mat[is.finite(d_mat) & d_mat > 0]
       
       if(length(valid_dists) > 0) {
@@ -254,13 +265,17 @@ compute_graph_metrics <- function(edges_path, nodes_path) {
       res$clustering <- if(is.na(tr)) 0 else tr
     }
   }
-  
   return(res)
 }
 
 # ---------------------- Main Loop ----------------------
 process_all <- function() {
   input_dir <- file.path(CFG$network_dir, CFG$input_subdir)
+  
+  if (!dir.exists(input_dir)) {
+    stop(sprintf("Input directory not found: %s. Please run build_network.R first.", input_dir))
+  }
+  
   edge_files <- list.files(input_dir, pattern = "_edges\\.csv$", recursive = TRUE, full.names = TRUE)
   
   if (length(edge_files) == 0) stop("No _edges.csv files found in ", input_dir)
@@ -301,6 +316,8 @@ process_all <- function() {
   final_df[is.na(final_df)] <- 0
   
   dir.create(CFG$output_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  # Use basename to create a distinct file for this run's parameters
   out_file <- sprintf("%s/%s_features_extended.csv", CFG$output_dir, basename(CFG$input_subdir))
   write.csv(final_df, out_file, row.names = FALSE)
   msg("Done! Extended features saved to %s", out_file)
