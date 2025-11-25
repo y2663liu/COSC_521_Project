@@ -1,11 +1,12 @@
 """Train gesture classifiers using graph metrics.
 
-This script performs two types of validation:
-1. In-Subject (Random Split): Tests physics generalization.
-2. Cross-Subject (Group Split): Tests new user generalization.
+This script performs robust Cross-Validation:
+1. In-Subject: 10-Fold Cross-Validation (Single Run).
+   Tests theoretical model capacity on mixed data.
+2. Cross-Subject: Leave-One-Group-Out (LOGO) Cross-Validation.
+   Iterates over EVERY participant to test generalization to new users.
 
-It generates a Feature Importance Report AFTER training to help identify 
-key metrics vs. noise.
+It generates a Feature Importance Report based on the full dataset.
 """
 from __future__ import annotations
 
@@ -21,7 +22,11 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import StratifiedShuffleSplit, GroupShuffleSplit
+from sklearn.model_selection import (
+    StratifiedKFold, 
+    LeaveOneGroupOut, 
+    cross_val_score
+)
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -49,18 +54,6 @@ def parse_args() -> argparse.Namespace:
         "--group-col",
         default="participant",
         help="Name of the participant/subject column for cross-subject validation (default: participant).",
-    )
-    parser.add_argument(
-        "--test-size-random",
-        type=float,
-        default=0.1,
-        help="Test split ratio for In-Subject validation (default: 0.1).",
-    )
-    parser.add_argument(
-        "--test-groups-count",
-        type=int,
-        default=1,
-        help="Number of participants to hold out for Cross-Subject validation (default: 1).",
     )
     parser.add_argument(
         "--random-state",
@@ -108,6 +101,7 @@ def load_dataset(path: Path, label_col: str, group_col: str) -> Tuple[pd.DataFra
 
     print(f"Loaded {len(df)} samples, {len(feature_cols)} features.")
     print(f"Classes found ({len(labels.unique())}): {sorted(labels.unique())}")
+    print(f"Participants found ({len(groups.unique())}): {sorted(groups.unique())}")
     
     return features, labels, groups
 
@@ -124,125 +118,98 @@ def build_pipeline(model) -> Pipeline:
     return Pipeline(steps=[("pre", preprocessing), ("model", model)])
 
 
-def report_feature_importance(pipeline: Pipeline, model_name: str):
-    """Extracts and prints feature importance from trained models."""
+def report_feature_importance(X: pd.DataFrame, y: pd.Series):
+    """Trains a single RF on full data to report Feature Importance."""
+    print("\n" + "="*60)
+    print("GLOBAL FEATURE IMPORTANCE ANALYSIS (Gini)")
+    print("="*60)
     
-    # We need to get the feature names coming OUT of the preprocessor
-    # (Because VarianceThreshold might have dropped some columns)
+    model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight="balanced")
+    pipe = build_pipeline(model)
+    
     try:
-        preprocessor = pipeline.named_steps["pre"]
-        feature_names = preprocessor.get_feature_names_out()
+        pipe.fit(X, y)
         
-        model = pipeline.named_steps["model"]
+        # Get names out of preprocessor
+        pre = pipe.named_steps["pre"]
+        feat_names = pre.get_feature_names_out()
         
-        importances = None
-        imp_type = ""
-
-        # Strategy 1: Tree-based Importance (Random Forest)
-        if hasattr(model, "feature_importances_"):
-            importances = model.feature_importances_
-            imp_type = "Gini Importance"
-            
-        # Strategy 2: Linear Model Coefficients (Logistic Regression / SVM)
-        elif hasattr(model, "coef_"):
-            # coef_ is shape (n_classes, n_features). We take the mean absolute value across classes.
-            importances = np.mean(np.abs(model.coef_), axis=0)
-            imp_type = "Mean Abs Coefficient"
-
-        if importances is not None:
-            df_imp = pd.DataFrame({"Feature": feature_names, "Importance": importances})
-            df_imp = df_imp.sort_values(by="Importance", ascending=False).reset_index(drop=True)
-            
-            print(f"\n--- {model_name} Feature Analysis ({imp_type}) ---")
-            print("TOP 15 KEY METRICS:")
-            print(df_imp.head(15))
-            
-            print("\nBOTTOM 10 UNIMPORTANT METRICS (Candidates for filtering):")
-            print(df_imp.tail(10))
-            print("-" * 40)
-            
+        # Get importances
+        rf = pipe.named_steps["model"]
+        imps = rf.feature_importances_
+        
+        df_imp = pd.DataFrame({"Feature": feat_names, "Importance": imps})
+        df_imp = df_imp.sort_values(by="Importance", ascending=False).reset_index(drop=True)
+        
+        print("TOP 15 KEY METRICS:")
+        print(df_imp.head(15))
+        print("\nBOTTOM 10 CANDIDATES FOR REMOVAL:")
+        print(df_imp.tail(10))
+        
     except Exception as e:
-        print(f"Could not extract feature importance for {model_name}: {e}")
+        print(f"Skipping importance report: {e}")
 
 
-def run_evaluation(
-    title: str,
-    X_train: pd.DataFrame, 
-    X_test: pd.DataFrame, 
-    y_train: pd.Series, 
-    y_test: pd.Series, 
-    random_state: int
-) -> None:
-    """Trains models and prints a consolidated report for a specific split."""
-    
-    print(f"\n{'='*60}")
-    print(f"RESULTS: {title}")
-    print(f"Train Size: {len(X_train)} | Test Size: {len(X_test)}")
-    print(f"{'='*60}")
-
-    if len(X_train) == 0 or len(X_test) == 0:
-        print("Error: Split resulted in empty train or test set. Skipping.")
-        return
-
-    models = {
+def get_models(random_state: int) -> Dict:
+    """Returns dictionary of models to train."""
+    return {
         "LogReg": LogisticRegression(
-            max_iter=2000, 
-            multi_class="auto", 
-            solver='lbfgs',
-            class_weight="balanced"
+            max_iter=2000, solver='lbfgs', class_weight="balanced"
         ),
         "LinearSVM": LinearSVC(
-            dual="auto", 
-            max_iter=2000,
-            class_weight="balanced"
+            dual="auto", max_iter=2000, class_weight="balanced"
         ),
         "RandomForest": RandomForestClassifier(
-            n_estimators=100, 
-            max_depth=None, 
-            random_state=random_state,
-            class_weight="balanced"
+            n_estimators=100, max_depth=None, random_state=random_state, class_weight="balanced"
         ),
-        "MLP (Neural Net)": MLPClassifier(
-            hidden_layer_sizes=(64,),
-            activation="relu",
-            max_iter=2000,
-            alpha=1e-3,
-            random_state=random_state,
+        "MLP": MLPClassifier(
+            hidden_layer_sizes=(64,), activation="relu", max_iter=2000, alpha=1e-3, random_state=random_state,
         ),
     }
 
+
+def run_insubject_cv(X: pd.DataFrame, y: pd.Series, random_state: int):
+    """10-Fold Cross Validation (Average Accuracy)."""
+    print("\n\n" + "="*60)
+    print("EXPERIMENT 1: In-Subject Validation (10-Fold CV)")
+    print("Tests robustness on mixed data.")
+    print("="*60)
+    
+    # Single run of 10-fold CV
+    kf = StratifiedKFold(n_splits=10, shuffle=True, random_state=random_state)
+    models = get_models(random_state)
+    
+    for name, model in models.items():
+        pipe = build_pipeline(model)
+        # Returns array of 10 scores
+        scores = cross_val_score(pipe, X, y, cv=kf, n_jobs=-1)
+        
+        mean_acc = np.mean(scores)
+        std_acc = np.std(scores)
+        
+        print(f"Model: {name:15s} | Avg Accuracy: {mean_acc:.2%} (+/- {std_acc:.2%})")
+
+
+def run_cross_subject_cv(X: pd.DataFrame, y: pd.Series, groups: pd.Series, random_state: int):
+    """Leave-One-Group-Out Cross Validation."""
+    print("\n\n" + "="*60)
+    print("EXPERIMENT 2: Cross-Subject Validation (Leave-One-Group-Out)")
+    print(f"Iterating over {len(groups.unique())} participants. Tests new user generalization.")
+    print("="*60)
+    
+    logo = LeaveOneGroupOut()
+    models = get_models(random_state)
+    
     for name, model in models.items():
         pipe = build_pipeline(model)
         
-        try:
-            pipe.fit(X_train, y_train)
-            preds = pipe.predict(X_test)
-            
-            acc = accuracy_score(y_test, preds)
-            f1 = f1_score(y_test, preds, average="macro")
-            
-            print(f"\n--- Model: {name} ---")
-            print(f"Accuracy: {acc:.2%}")
-            print(f"Macro F1: {f1:.3f}")
-            
-            # --- Feature Importance Reporting ---
-            # We report this mainly for Random Forest (Non-linear) and LogReg (Linear)
-            if name in ["RandomForest", "LogReg"]:
-                report_feature_importance(pipe, name)
-
-            labels = np.unique(np.concatenate((y_test, preds)))
-            cm = confusion_matrix(y_test, preds, labels=labels)
-            cm_df = pd.DataFrame(cm, index=labels, columns=labels)
-            
-            if name == "RandomForest":
-                print("\nDetailed Report (Random Forest):")
-                print(classification_report(y_test, preds, zero_division=0))
-            else:
-                print("Confusion Matrix:")
-                print(cm_df)
-                
-        except Exception as e:
-            print(f"Failed to train {name}: {e}")
+        # cross_val_score automatically handles the groups iteration
+        scores = cross_val_score(pipe, X, y, groups=groups, cv=logo, n_jobs=-1)
+        
+        mean_acc = np.mean(scores)
+        std_acc = np.std(scores) # High std dev means it works great for some users, fails for others
+        
+        print(f"Model: {name:15s} | Avg Accuracy: {mean_acc:.2%} (+/- {std_acc:.2%})")
 
 
 def main() -> None:
@@ -253,42 +220,20 @@ def main() -> None:
     except Exception as exc:
         sys.exit(f"Data Load Error: {exc}")
 
-    # --- VALIDATION 1: In-Subject ---
-    print("\n\n>>> STARTING EXPERIMENT 1: In-Subject Validation (Mixed Data) <<<")
-    
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=args.test_size_random, random_state=args.random_state)
-    
-    train_idx, test_idx = next(sss.split(X, y))
-    run_evaluation(
-        f"In-Subject (Random Split {args.test_size_random*100}%)",
-        X.iloc[train_idx], X.iloc[test_idx],
-        y.iloc[train_idx], y.iloc[test_idx],
-        args.random_state
-    )
+    if len(X) < 50:
+        print("WARNING: Dataset is extremely small. Cross-validation results may be unstable.")
 
-    # --- VALIDATION 2: Cross-Subject ---
-    print("\n\n>>> STARTING EXPERIMENT 2: Cross-Subject Validation (Unseen Users) <<<")
-    
-    unique_groups = groups.unique()
-    n_groups = len(unique_groups)
-    
-    if n_groups <= args.test_groups_count:
-        print(f"WARNING: Total participants ({n_groups}) <= hold-out count ({args.test_groups_count}). Skipping.")
+    # 1. Feature Analysis (Global)
+    report_feature_importance(X, y)
+
+    # 2. In-Subject (10-fold)
+    run_insubject_cv(X, y, args.random_state)
+
+    # 3. Cross-Subject (Iterate all participants)
+    if len(groups.unique()) > 1:
+        run_cross_subject_cv(X, y, groups, args.random_state)
     else:
-        gss = GroupShuffleSplit(n_splits=1, test_size=args.test_groups_count, random_state=args.random_state)
-        
-        train_idx, test_idx = next(gss.split(X, y, groups=groups))
-        
-        test_participants = groups.iloc[test_idx].unique()
-        print(f"Total Participants: {n_groups}")
-        print(f"Held-out Participants ({len(test_participants)}): {test_participants}")
-        
-        run_evaluation(
-            f"Cross-Subject (Held out {args.test_groups_count} users)",
-            X.iloc[train_idx], X.iloc[test_idx],
-            y.iloc[train_idx], y.iloc[test_idx],
-            args.random_state
-        )
+        print("\nSkipping Cross-Subject: Only 1 participant found in data.")
 
 
 if __name__ == "__main__":
