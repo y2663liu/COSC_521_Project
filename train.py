@@ -4,7 +4,11 @@ This script performs robust Cross-Validation:
 1. In-Subject: 10-Fold Cross-Validation (Single Run).
 2. Cross-Subject: Leave-One-Group-Out (LOGO) Cross-Validation.
 
-It saves the final trained models (trained on the full dataset) to the specified directory.
+It implements a Recursive Feature Elimination (RFE) loop:
+- Runs the training/evaluation 5 times.
+- Keeps track of the best performing feature sets.
+- At the end, saves ONLY the models corresponding to the best In-Subject 
+  and best Cross-Subject performance.
 """
 from __future__ import annotations
 
@@ -57,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         "--save-dir",
         type=Path,
         default=None,
-        help="Directory to save the final trained models.",
+        help="Directory to save the trained models.",
     )
     parser.add_argument(
         "--random-state",
@@ -113,10 +117,9 @@ def build_pipeline(model) -> Pipeline:
     return Pipeline(steps=[("pre", preprocessing), ("model", model)])
 
 
-def report_feature_importance(X: pd.DataFrame, y: pd.Series):
-    print("\n" + "="*60)
-    print("GLOBAL FEATURE IMPORTANCE ANALYSIS (Gini)")
-    print("="*60)
+def get_least_important_features(X: pd.DataFrame, y: pd.Series, n_remove: int = 2) -> List[str]:
+    """Trains a RF to find the least important features to prune."""
+    print(f"\n>>> Analyzing Feature Importance to drop bottom {n_remove}...")
     
     model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight="balanced")
     pipe = build_pipeline(model)
@@ -129,15 +132,16 @@ def report_feature_importance(X: pd.DataFrame, y: pd.Series):
         imps = rf.feature_importances_
         
         df_imp = pd.DataFrame({"Feature": feat_names, "Importance": imps})
-        df_imp = df_imp.sort_values(by="Importance", ascending=False).reset_index(drop=True)
+        df_imp = df_imp.sort_values(by="Importance", ascending=True) 
         
-        print("TOP 15 KEY METRICS:")
-        print(df_imp.head(15))
-        print("\nBOTTOM 10 CANDIDATES FOR REMOVAL:")
-        print(df_imp.tail(10))
+        to_drop = df_imp["Feature"].head(n_remove).tolist()
+        
+        print(f"Dropping features: {to_drop}")
+        return to_drop
         
     except Exception as e:
-        print(f"Skipping importance report: {e}")
+        print(f"Error calculating importance: {e}")
+        return []
 
 
 def get_models(random_state: int) -> Dict:
@@ -157,40 +161,52 @@ def get_models(random_state: int) -> Dict:
     }
 
 
-def run_insubject_cv(X: pd.DataFrame, y: pd.Series, random_state: int):
-    print("\n\n" + "="*60)
-    print("EXPERIMENT 1: In-Subject Validation (10-Fold CV)")
-    print("="*60)
+def run_insubject_cv(X: pd.DataFrame, y: pd.Series, random_state: int) -> float:
+    """Returns the BEST average accuracy achieved by any model in this suite."""
+    print("\n--- EXPERIMENT 1: In-Subject Validation (10-Fold CV) ---")
     
     kf = StratifiedKFold(n_splits=10, shuffle=True, random_state=random_state)
     models = get_models(random_state)
     
+    best_acc = 0.0
+    
     for name, model in models.items():
         pipe = build_pipeline(model)
         scores = cross_val_score(pipe, X, y, cv=kf, n_jobs=-1)
-        print(f"Model: {name:15s} | Avg Accuracy: {np.mean(scores):.2%} (+/- {np.std(scores):.2%})")
+        mean_acc = np.mean(scores)
+        
+        print(f"Model: {name:15s} | Avg Accuracy: {mean_acc:.2%} (+/- {np.std(scores):.2%})")
+        
+        if mean_acc > best_acc:
+            best_acc = mean_acc
+            
+    return best_acc
 
 
-def run_cross_subject_cv(X: pd.DataFrame, y: pd.Series, groups: pd.Series, random_state: int):
-    print("\n\n" + "="*60)
-    print("EXPERIMENT 2: Cross-Subject Validation (Leave-One-Group-Out)")
-    print("="*60)
+def run_cross_subject_cv(X: pd.DataFrame, y: pd.Series, groups: pd.Series, random_state: int) -> float:
+    """Returns the BEST average accuracy achieved by any model in this suite."""
+    print("\n--- EXPERIMENT 2: Cross-Subject Validation (Leave-One-Group-Out) ---")
     
     logo = LeaveOneGroupOut()
     models = get_models(random_state)
     
+    best_acc = 0.0
+    
     for name, model in models.items():
         pipe = build_pipeline(model)
         scores = cross_val_score(pipe, X, y, groups=groups, cv=logo, n_jobs=-1)
-        print(f"Model: {name:15s} | Avg Accuracy: {np.mean(scores):.2%} (+/- {np.std(scores):.2%})")
+        mean_acc = np.mean(scores)
+        
+        print(f"Model: {name:15s} | Avg Accuracy: {mean_acc:.2%} (+/- {np.std(scores):.2%})")
+        
+        if mean_acc > best_acc:
+            best_acc = mean_acc
+            
+    return best_acc
 
 
-def save_final_models(X: pd.DataFrame, y: pd.Series, save_dir: Path, random_state: int):
+def save_final_models(X: pd.DataFrame, y: pd.Series, save_dir: Path, random_state: int, suffix: str = ""):
     """Trains models on ALL data and saves them to disk."""
-    print("\n\n" + "="*60)
-    print("SAVING FINAL MODELS (Trained on Full Dataset)")
-    print("="*60)
-    
     if not save_dir.exists():
         os.makedirs(save_dir)
         
@@ -200,9 +216,8 @@ def save_final_models(X: pd.DataFrame, y: pd.Series, save_dir: Path, random_stat
         pipe = build_pipeline(model)
         pipe.fit(X, y)
         
-        # Sanitize name for filename
         safe_name = name.replace(" ", "_").replace("(", "").replace(")", "")
-        filename = save_dir / f"{safe_name}.joblib"
+        filename = save_dir / f"{safe_name}{suffix}.joblib"
         
         joblib.dump(pipe, filename)
         print(f"Saved {name} to: {filename}")
@@ -219,19 +234,77 @@ def main() -> None:
     if len(X) < 50:
         print("WARNING: Dataset is extremely small. Cross-validation results may be unstable.")
 
-    # 1. Feature Analysis
-    report_feature_importance(X, y)
-
-    # 2. In-Subject Validation
-    run_insubject_cv(X, y, args.random_state)
-
-    # 3. Cross-Subject Validation
-    if len(groups.unique()) > 1:
-        run_cross_subject_cv(X, y, groups, args.random_state)
+    # RFE Loop Configuration
+    total_rounds = 25
+    current_X = X.copy()
     
-    # 4. Save Models
+    # Track best performance
+    # Structure: {"round": int, "features": [cols], "score": float}
+    best_insubject = {"round": 0, "features": [], "score": -1.0}
+    best_cross = {"round": 0, "features": [], "score": -1.0}
+    
+    print(f"\n>>> Starting Recursive Feature Elimination ({total_rounds} Rounds)")
+    
+    for round_idx in range(1, total_rounds + 1):
+        print("\n" + "="*60)
+        print(f"ROUND {round_idx} / {total_rounds}")
+        print(f"Features Count: {current_X.shape[1]}")
+        print("="*60)
+        
+        # 1. In-Subject Validation
+        score_in = run_insubject_cv(current_X, y, args.random_state)
+        if score_in > best_insubject["score"]:
+            best_insubject = {
+                "round": round_idx, 
+                "features": current_X.columns.tolist(), 
+                "score": score_in
+            }
+
+        # 2. Cross-Subject Validation
+        if len(groups.unique()) > 1:
+            score_cross = run_cross_subject_cv(current_X, y, groups, args.random_state)
+            if score_cross > best_cross["score"]:
+                best_cross = {
+                    "round": round_idx, 
+                    "features": current_X.columns.tolist(), 
+                    "score": score_cross
+                }
+        else:
+            score_cross = 0.0
+
+        # 3. Pruning (Prepare for next round)
+        if round_idx < total_rounds:
+            drop_candidates = get_least_important_features(current_X, y, n_remove=1)
+            
+            if not drop_candidates:
+                print("No features returned to drop. Stopping RFE early.")
+                break
+            if current_X.shape[1] - len(drop_candidates) < 2:
+                print("Warning: Too few features remaining. Stopping RFE.")
+                break
+                
+            current_X = current_X.drop(columns=drop_candidates)
+
+    # --- FINAL SUMMARY & SAVING ---
+    print("\n" + "="*60)
+    print("FINAL RESULTS SUMMARY")
+    print("="*60)
+    
+    print(f"BEST IN-SUBJECT:    Round {best_insubject['round']} (Acc: {best_insubject['score']:.2%})")
+    print(f"BEST CROSS-SUBJECT: Round {best_cross['round']} (Acc: {best_cross['score']:.2%})")
+    
     if args.save_dir:
-        save_final_models(X, y, args.save_dir, args.random_state)
+        print("\n>>> Saving Top Performing Models...")
+        
+        # Save Best In-Subject
+        cols_in = best_insubject["features"]
+        save_final_models(X[cols_in], y, args.save_dir, args.random_state, suffix="_BestInSubject")
+        
+        # Save Best Cross-Subject (Check if it's different to avoid redundant work, though saving twice is fine)
+        cols_cross = best_cross["features"]
+        save_final_models(X[cols_cross], y, args.save_dir, args.random_state, suffix="_BestCrossSubject")
+        
+        print(f"\nModels saved to {args.save_dir}")
 
 
 if __name__ == "__main__":
