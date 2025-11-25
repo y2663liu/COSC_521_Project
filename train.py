@@ -2,22 +2,22 @@
 
 This script performs robust Cross-Validation:
 1. In-Subject: 10-Fold Cross-Validation (Single Run).
-   Tests theoretical model capacity on mixed data.
 2. Cross-Subject: Leave-One-Group-Out (LOGO) Cross-Validation.
-   Iterates over EVERY participant to test generalization to new users.
 
-It generates a Feature Importance Report based on the full dataset.
+It saves the final trained models (trained on the full dataset) to the specified directory.
 """
 from __future__ import annotations
 
 import argparse
 import sys
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import sklearn
+import joblib  # For saving models
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -41,8 +41,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "data",
         type=Path,
-        default=Path("train_data/raw_iou0.20_move0.90_dist10_simple_features_extended_rewritten.csv"),
-        nargs="?",
         help="Path to the feature CSV.",
     )
     parser.add_argument(
@@ -56,6 +54,12 @@ def parse_args() -> argparse.Namespace:
         help="Name of the participant/subject column for cross-subject validation (default: participant).",
     )
     parser.add_argument(
+        "--save-dir",
+        type=Path,
+        default=None,
+        help="Directory to save the final trained models.",
+    )
+    parser.add_argument(
         "--random-state",
         type=int,
         default=42,
@@ -65,14 +69,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_dataset(path: Path, label_col: str, group_col: str) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """Loads data and separates Features (X), Labels (y), and Groups (participants)."""
-    
     if not path.exists():
         raise FileNotFoundError(f"CSV file not found: {path}")
 
     df = pd.read_csv(path)
 
-    # 1. Header Cleaning
     if not df.empty:
         cols_norm = [str(c).strip().lower() for c in df.columns]
         first_norm = [str(v).strip().lower() for v in df.iloc[0]]
@@ -81,13 +82,11 @@ def load_dataset(path: Path, label_col: str, group_col: str) -> Tuple[pd.DataFra
             print("Note: Dropping first row (appears to be repeated header).", file=sys.stderr)
             df = df.iloc[1:].reset_index(drop=True)
 
-    # 2. Validation
     if label_col not in df.columns:
         raise ValueError(f"Label column '{label_col}' not found in {path}")
     if group_col not in df.columns:
-        raise ValueError(f"Group column '{group_col}' not found. Required for cross-subject validation.")
+        raise ValueError(f"Group column '{group_col}' not found.")
 
-    # 3. Extraction
     labels = df[label_col].astype(str)
     groups = df[group_col].astype(str)
     
@@ -95,19 +94,15 @@ def load_dataset(path: Path, label_col: str, group_col: str) -> Tuple[pd.DataFra
     feature_cols = [c for c in df.columns if c not in cols_to_drop]
     
     features = df[feature_cols]
-    
-    # Coerce to numeric
     features = features.apply(pd.to_numeric, errors='coerce')
 
     print(f"Loaded {len(df)} samples, {len(feature_cols)} features.")
     print(f"Classes found ({len(labels.unique())}): {sorted(labels.unique())}")
-    print(f"Participants found ({len(groups.unique())}): {sorted(groups.unique())}")
     
     return features, labels, groups
 
 
 def build_pipeline(model) -> Pipeline:
-    """Creates a robust preprocessing and training pipeline."""
     preprocessing = Pipeline(
         steps=[
             ("impute", SimpleImputer(strategy="median")), 
@@ -119,7 +114,6 @@ def build_pipeline(model) -> Pipeline:
 
 
 def report_feature_importance(X: pd.DataFrame, y: pd.Series):
-    """Trains a single RF on full data to report Feature Importance."""
     print("\n" + "="*60)
     print("GLOBAL FEATURE IMPORTANCE ANALYSIS (Gini)")
     print("="*60)
@@ -129,12 +123,8 @@ def report_feature_importance(X: pd.DataFrame, y: pd.Series):
     
     try:
         pipe.fit(X, y)
-        
-        # Get names out of preprocessor
         pre = pipe.named_steps["pre"]
         feat_names = pre.get_feature_names_out()
-        
-        # Get importances
         rf = pipe.named_steps["model"]
         imps = rf.feature_importances_
         
@@ -151,7 +141,6 @@ def report_feature_importance(X: pd.DataFrame, y: pd.Series):
 
 
 def get_models(random_state: int) -> Dict:
-    """Returns dictionary of models to train."""
     return {
         "LogReg": LogisticRegression(
             max_iter=2000, solver='lbfgs', class_weight="balanced"
@@ -169,32 +158,22 @@ def get_models(random_state: int) -> Dict:
 
 
 def run_insubject_cv(X: pd.DataFrame, y: pd.Series, random_state: int):
-    """10-Fold Cross Validation (Average Accuracy)."""
     print("\n\n" + "="*60)
     print("EXPERIMENT 1: In-Subject Validation (10-Fold CV)")
-    print("Tests robustness on mixed data.")
     print("="*60)
     
-    # Single run of 10-fold CV
     kf = StratifiedKFold(n_splits=10, shuffle=True, random_state=random_state)
     models = get_models(random_state)
     
     for name, model in models.items():
         pipe = build_pipeline(model)
-        # Returns array of 10 scores
         scores = cross_val_score(pipe, X, y, cv=kf, n_jobs=-1)
-        
-        mean_acc = np.mean(scores)
-        std_acc = np.std(scores)
-        
-        print(f"Model: {name:15s} | Avg Accuracy: {mean_acc:.2%} (+/- {std_acc:.2%})")
+        print(f"Model: {name:15s} | Avg Accuracy: {np.mean(scores):.2%} (+/- {np.std(scores):.2%})")
 
 
 def run_cross_subject_cv(X: pd.DataFrame, y: pd.Series, groups: pd.Series, random_state: int):
-    """Leave-One-Group-Out Cross Validation."""
     print("\n\n" + "="*60)
     print("EXPERIMENT 2: Cross-Subject Validation (Leave-One-Group-Out)")
-    print(f"Iterating over {len(groups.unique())} participants. Tests new user generalization.")
     print("="*60)
     
     logo = LeaveOneGroupOut()
@@ -202,14 +181,31 @@ def run_cross_subject_cv(X: pd.DataFrame, y: pd.Series, groups: pd.Series, rando
     
     for name, model in models.items():
         pipe = build_pipeline(model)
-        
-        # cross_val_score automatically handles the groups iteration
         scores = cross_val_score(pipe, X, y, groups=groups, cv=logo, n_jobs=-1)
+        print(f"Model: {name:15s} | Avg Accuracy: {np.mean(scores):.2%} (+/- {np.std(scores):.2%})")
+
+
+def save_final_models(X: pd.DataFrame, y: pd.Series, save_dir: Path, random_state: int):
+    """Trains models on ALL data and saves them to disk."""
+    print("\n\n" + "="*60)
+    print("SAVING FINAL MODELS (Trained on Full Dataset)")
+    print("="*60)
+    
+    if not save_dir.exists():
+        os.makedirs(save_dir)
         
-        mean_acc = np.mean(scores)
-        std_acc = np.std(scores) # High std dev means it works great for some users, fails for others
+    models = get_models(random_state)
+    
+    for name, model in models.items():
+        pipe = build_pipeline(model)
+        pipe.fit(X, y)
         
-        print(f"Model: {name:15s} | Avg Accuracy: {mean_acc:.2%} (+/- {std_acc:.2%})")
+        # Sanitize name for filename
+        safe_name = name.replace(" ", "_").replace("(", "").replace(")", "")
+        filename = save_dir / f"{safe_name}.joblib"
+        
+        joblib.dump(pipe, filename)
+        print(f"Saved {name} to: {filename}")
 
 
 def main() -> None:
@@ -223,17 +219,19 @@ def main() -> None:
     if len(X) < 50:
         print("WARNING: Dataset is extremely small. Cross-validation results may be unstable.")
 
-    # 1. Feature Analysis (Global)
+    # 1. Feature Analysis
     report_feature_importance(X, y)
 
-    # 2. In-Subject (10-fold)
+    # 2. In-Subject Validation
     run_insubject_cv(X, y, args.random_state)
 
-    # 3. Cross-Subject (Iterate all participants)
+    # 3. Cross-Subject Validation
     if len(groups.unique()) > 1:
         run_cross_subject_cv(X, y, groups, args.random_state)
-    else:
-        print("\nSkipping Cross-Subject: Only 1 participant found in data.")
+    
+    # 4. Save Models
+    if args.save_dir:
+        save_final_models(X, y, args.save_dir, args.random_state)
 
 
 if __name__ == "__main__":
