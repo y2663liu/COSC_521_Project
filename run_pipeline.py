@@ -9,8 +9,6 @@ def run_command(cmd, log_file=None):
     
     if log_file:
         # Run and redirect stdout/stderr to file AND print to console
-        # Using tee-like behavior is complex in python subprocess without buffering issues.
-        # Simpler approach: Run and capture, then write to file.
         
         # Ensure directory exists
         os.makedirs(os.path.dirname(log_file), exist_ok=True)

@@ -5,7 +5,7 @@ This script performs robust Cross-Validation:
 2. Cross-Subject: Leave-One-Group-Out (LOGO) Cross-Validation.
 
 It implements a Recursive Feature Elimination (RFE) loop:
-- Runs the training/evaluation 5 times.
+- Runs the training/evaluation 25 times.
 - Keeps track of the best performing feature sets.
 - At the end, saves ONLY the models corresponding to the best In-Subject 
   and best Cross-Subject performance.
@@ -296,7 +296,7 @@ def main() -> None:
     if args.save_dir:
         print("\n>>> Saving Top Performing Models...")
         
-        # Save Best In-Subject
+        # Save Best In-Subject TODO: report accuracy
         cols_in = best_insubject["features"]
         save_final_models(X[cols_in], y, args.save_dir, args.random_state, suffix="_BestInSubject")
         

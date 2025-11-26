@@ -13,7 +13,6 @@ params <- fromJSON(CONFIG_FILE)
 pool_lbl <- if(params$use_pooling) "pool" else "raw"
 rm_dup_lbl <- if(params$remove_duplicates) "simple" else "complex"
 
-# Format: raw_iou0.20_move0.90_dist20_simple
 generated_subdir <- sprintf("%s_iou%.2f_move%.2f_dist%.0f_%s", 
                             pool_lbl, 
                             params$iou_threshold, 
