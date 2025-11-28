@@ -1,5 +1,5 @@
 {
-  "base_dir": "./../PressureSensorPi/",
+  "base_dir": "./raw_data/",
   "network_dir": "networks",
   "feature_dir": "train_data",
   
